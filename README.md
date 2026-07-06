@@ -8,7 +8,7 @@ Then set the API key for the given LLM:
 
 Please make sure Docker is installed and running on your machine.
 
-Run our java version of FlakyGuard using the below command:
+Please clone the folder, all files are required to be in the root for the tool to run. Run our java version of FlakyGuard using the below command:
 
 `bash run_all_flakyguard.sh > fg_run.log`
 
