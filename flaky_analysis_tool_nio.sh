@@ -7,7 +7,10 @@ FULL_TEST_NAME=$4
 ITERATIONS=${5:-5}
 CODE_VERSION=${6:-"All"}  
 
-BASE_IMAGE_NAME="flaky_base_jdk8_cover"
+#BASE_IMAGE_NAME="flaky_base_jdk8_cover"
+
+BASE_IMAGE_NAME="flaky_base_jdk8_nio"
+
 CONTAINER_NAME="Nio$TEST_FOLDER_NAME"
 DIR_TO_PYTHON_SCRIPT="/app/source"
 BASE_DIR="data/${TEST_FOLDER_NAME}"
@@ -95,7 +98,13 @@ esac
 
 mkdir -p "$RESULT_DIR"
 
-docker build -t $BASE_IMAGE_NAME .
+#docker build -t $BASE_IMAGE_NAME .
+
+if ! docker images | grep -q "$BASE_IMAGE_NAME"; then
+    docker build -t $BASE_IMAGE_NAME -f Dockerfile.nio .
+fi
+
+
 
 for i in "${!SOURCE_DIRS[@]}"; do
 
@@ -115,8 +124,10 @@ for i in "${!SOURCE_DIRS[@]}"; do
     --mount type=bind,source="$HOST_M2_ABS",target=/root/.m2 \
     "$BASE_IMAGE_NAME" \
     tail -f /dev/null
-     #docker exec -i $CONTAINER_NAME /bin/bash -c "cd /app/source && chmod +x nio_statistics_generator.sh && ./nio_statistics_generator.sh \"$MODULE\" \"$DIR_TO_PYTHON_SCRIPT\" \"$FULL_TEST_NAME\" \"$ITERATIONS\""
-    docker exec -i $CONTAINER_NAME /bin/bash -c "cd /app/source && chmod +x nio_statistics_generator.sh && ./nio_statistics_generator.sh \"$MODULE\" \"$FULL_TEST_NAME\" \"$ITERATIONS\""
+
+    docker exec -i $CONTAINER_NAME /bin/bash -c "cd /app/source && chmod +x nio_statistics_generator.sh && ./nio_statistics_generator.sh \"$MODULE\" \"$DIR_TO_PYTHON_SCRIPT\" \"$FULL_TEST_NAME\" \"$ITERATIONS\""
+   
+    docker exec "$CONTAINER_NAME" bash -c "find /app/source -name 'failing-test-output-*' -exec cat {} \;" > "${RESULT_DIR/S{DIR_NAME}_failing_output.log" 2>/dev/null || true
    
     mkdir -p "$FLAKY_RESULT_DIR"
     cp -a "$SRC_DIR/flaky-result/." "$FLAKY_RESULT_DIR/"
