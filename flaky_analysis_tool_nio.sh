@@ -7,8 +7,6 @@ FULL_TEST_NAME=$4
 ITERATIONS=${5:-5}
 CODE_VERSION=${6:-"All"}  
 
-#BASE_IMAGE_NAME="flaky_base_jdk8_cover"
-
 BASE_IMAGE_NAME="flaky_base_jdk8_nio"
 
 CONTAINER_NAME="Nio$TEST_FOLDER_NAME"
@@ -97,8 +95,6 @@ case "$CODE_VERSION" in
 esac
 
 mkdir -p "$RESULT_DIR"
-
-#docker build -t $BASE_IMAGE_NAME .
 
 if ! docker images | grep -q "$BASE_IMAGE_NAME"; then
     docker build -t $BASE_IMAGE_NAME -f Dockerfile.nio .
