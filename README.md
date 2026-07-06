@@ -1,10 +1,10 @@
 First, set the LLM provider, we used Claude as our LLM using:
 
-export FLAKYGUARD_LLM_PROVIDER=anthropic
+`export FLAKYGUARD_LLM_PROVIDER=anthropic`
 
 Then set the API key for the given LLM:
 
-export ANTHROPIC_API_KEY="<insert API key here>"
+`export ANTHROPIC_API_KEY="<insert API key here>"`
 
 Please make sure Docker is installed and running on your machine.
 
