@@ -1,7 +1,3 @@
-"""
-core/types.py – shared dataclasses for FlakyGuard Simple.
-"""
-
 from __future__ import annotations
 
 import dataclasses
