@@ -1,0 +1,5 @@
+edu/illinois/cs/dt/samples/ExampleMinimizeClassA.class
+edu/illinois/cs/dt/samples/ExampleTimeoutTests.class
+edu/illinois/cs/dt/samples/ExampleMinimizeClassB.class
+edu/illinois/cs/dt/samples/ExampleHasFlakyTests.class
+com/fake/example/test/TestPollutionDetection.class

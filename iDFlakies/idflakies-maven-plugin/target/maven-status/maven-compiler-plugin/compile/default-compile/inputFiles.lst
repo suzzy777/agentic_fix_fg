@@ -1,0 +1,11 @@
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/IncDetectorMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/ReplayMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/utility/MvnCommands.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/ModuleTestTimeMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/AbstractIDFlakiesMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/target/generated-sources/plugin/HelpMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/DetectorMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/BulkOrderRunnerMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/detection/MavenDetectorPathManager.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/CleanerFixerMojo.java
+/home/srafi/idflakies_nio/iDFlakies/idflakies-maven-plugin/src/main/java/edu/illinois/cs/dt/tools/plugin/MinimizerMojo.java

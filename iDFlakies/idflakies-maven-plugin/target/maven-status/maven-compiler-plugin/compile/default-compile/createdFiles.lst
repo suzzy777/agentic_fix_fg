@@ -1,0 +1,11 @@
+edu/illinois/cs/dt/tools/plugin/AbstractIDFlakiesMojo.class
+edu/illinois/cs/dt/tools/plugin/IncDetectorMojo.class
+HelpMojo.class
+edu/illinois/cs/dt/tools/plugin/ModuleTestTimeMojo.class
+edu/illinois/cs/dt/tools/detection/MavenDetectorPathManager.class
+edu/illinois/cs/dt/tools/plugin/MinimizerMojo.class
+edu/illinois/cs/dt/tools/plugin/ReplayMojo.class
+edu/illinois/cs/dt/tools/plugin/BulkOrderRunnerMojo.class
+edu/illinois/cs/dt/tools/plugin/CleanerFixerMojo.class
+edu/illinois/cs/dt/tools/utility/MvnCommands.class
+edu/illinois/cs/dt/tools/plugin/DetectorMojo.class

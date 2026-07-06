@@ -1,0 +1,5 @@
+edu/illinois/cs/dt/tools/detection/LegacyDetectorPathManager.class
+edu/illinois/cs/dt/tools/utility/BulkOrderRunnerPlugin.class
+edu/illinois/cs/dt/tools/utility/ReplayPlugin.class
+edu/illinois/cs/dt/tools/utility/ModuleTestTimePlugin.class
+edu/illinois/cs/dt/tools/detection/DetectorPlugin.class
