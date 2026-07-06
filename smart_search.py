@@ -1,20 +1,3 @@
-"""
-analysis/smart_search.py – LLM-guided BFS over the call graph.
-
-This is Algorithm 1 from the paper:
-  "Smart Graph Traversal with GenAI"
-
-At each BFS step the LLM is asked which of the callee nodes are most
-relevant to the flaky-test error, instead of blindly expanding all
-neighbors.  After traversal, a second LLM call selects the globally
-most relevant F functions (post-processing filter).
-
-Key parameters (all configurable):
-  k  – max children the LLM may select per node  (paper default: 3)
-  d  – depth limit (-1 = infinite)               (paper default: ∞)
-  F  – final global filter size                  (paper default: 5)
-"""
-
 from __future__ import annotations
 import logging
 import re
