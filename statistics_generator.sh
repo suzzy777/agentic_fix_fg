@@ -15,7 +15,11 @@ fail_count=0
 error_count=0
 
 
-bash ./coverage_generator.sh "$module" "$dir_to_python_script" "$full_test_name" 1
+if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
+    echo "SKIP_COVERAGE=1 -> skipping coverage generation"
+else
+    bash ./coverage_generator.sh "$module" "$dir_to_python_script" "$full_test_name" 1 td || echo "Coverage failed; continuing"
+fi
 
 for ((i=0; i<iterations; i++)); do
     find . -name "TEST-*.xml" -delete

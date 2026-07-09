@@ -29,3 +29,16 @@ xmlstarlet ed -L -N x="$NS" \
   -x "concat('\${argLine} ', .)" \
   "$POM_FILE"
 
+# 5) Ensure an empty default <argLine> property so ${argLine} still resolves
+#    on plain runs that pass no -DargLine (otherwise the literal string
+#    ${argLine} reaches the forked JVM and it fails to start)
+xmlstarlet ed -L -N x="$NS" \
+  -s "/x:project[not(x:properties)]" \
+    -t elem -n properties -v "" \
+  "$POM_FILE"
+
+xmlstarlet ed -L -N x="$NS" \
+  -s "/x:project/x:properties[not(x:argLine)]" \
+    -t elem -n argLine -v "" \
+  "$POM_FILE"
+

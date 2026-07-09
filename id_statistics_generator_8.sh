@@ -25,7 +25,11 @@ else
    SEED_PARAM=""
 fi
 
-bash ./coverage_generator.sh "$MODULE" . "$TEST" 1 || echo "Coverage failed; continuing"
+if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
+    echo "SKIP_COVERAGE=1 -> skipping coverage generation"
+else
+    bash ./coverage_generator.sh "$MODULE" . "$TEST" 1 id "$NONDEXSEED" 2.1.1 || echo "Coverage failed; continuing"
+fi
 
 OUTPUT=$(mvn -pl "$MODULE" edu.illinois:nondex-maven-plugin:2.1.1:nondex \
  $SEED_PARAM -DnondexRuns=$rounds -Dtest="$TEST" $MVNOPTIONS 2>&1)

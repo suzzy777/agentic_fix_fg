@@ -28,7 +28,11 @@ build_if_exists() {
 build_if_exists "$TESTRUNNER_DIR" "testrunner"
 build_if_exists "$IDFLAKIES_DIR" "iDFlakies"
 
-bash ./coverage_generator.sh "$module" . "$full_test_name" 1 || echo "Coverage failed; continuing"
+if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
+    echo "SKIP_COVERAGE=1 -> skipping coverage generation"
+else
+    bash ./coverage_generator.sh "$module" . "$complete_test_name" 1 nio || echo "Coverage failed; continuing"
+fi
 
 MVNOPTIONS="-Ddependency-check.skip=true -Dgpg.skip=true -DfailIfNoTests=false \
 -Dskip.installnodenpm -Dskip.npm -Dskip.yarn -Dlicense.skip \

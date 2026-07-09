@@ -53,6 +53,7 @@ if [ -d "$FLAKY_DIR" ]; then
     cp jacocoagent.jar "$FLAKY_DIR/" || { echo "Failed to copy jacocoagent.jar"; exit 1; }
     cp jacococli.jar "$FLAKY_DIR/" || { echo "Failed to copy jacococli.jar"; exit 1; }
     cp coverage_generator.sh "$FLAKY_DIR/" || { echo "Failed to copy coverage_generator.sh"; exit 1; }
+    cp modify_pom_for_coverage.sh "$FLAKY_DIR/" || { echo "Failed to copy modify_pom_for_coverage.sh"; exit 1; }
     cp -r python-scripts "$FLAKY_DIR/" || { echo "Failed to copy Python scripts"; exit 1; }
     cp statistics_generator.sh "$FLAKY_DIR/" || { echo "Failed to copy statistics_generator.sh"; exit 1; }
 else
@@ -79,9 +80,28 @@ if [[ "$CODE_VERSION" == "All" || "$CODE_VERSION" == "FlakyCodeChange" ]]; then
     fi
 fi
 
+# Ensure FlakyCodeChange runs with the current helper scripts even when the
+# artifact zip ships its own copy of the folder.
+if [ -d "$FLAKY_CODE_CHANGE_DIR" ]; then
+    cp jacocoagent.jar jacococli.jar coverage_generator.sh modify_pom_for_coverage.sh statistics_generator.sh "$FLAKY_CODE_CHANGE_DIR/" 2>/dev/null || true
+    cp -r python-scripts "$FLAKY_CODE_CHANGE_DIR/" 2>/dev/null || true
+fi
+
 if [[ "$CODE_VERSION" == "All" || "$CODE_VERSION" == "Fixed" ]]; then
+    # For TD candidate validation, runner.py sets FLAKYGUARD_FIXED_BASE so the
+    # patched code is built on the sleep-injected FlakyCodeChange copy —
+    # otherwise the flake cannot manifest and validation passes trivially.
+    FIXED_BASE_SRC="$FLAKY_DIR"
+    if [[ "${FLAKYGUARD_FIXED_BASE:-}" == "FlakyCodeChange" ]]; then
+        if [[ ! -d "$FLAKY_CODE_CHANGE_DIR" ]]; then
+            create_folder_with_patch "$FLAKY_DIR" "$FLAKY_CODE_CHANGE_PATCH" "$FLAKY_CODE_CHANGE_DIR"
+        fi
+        cp jacocoagent.jar jacococli.jar coverage_generator.sh modify_pom_for_coverage.sh statistics_generator.sh "$FLAKY_CODE_CHANGE_DIR/" 2>/dev/null || true
+        cp -r python-scripts "$FLAKY_CODE_CHANGE_DIR/" 2>/dev/null || true
+        FIXED_BASE_SRC="$FLAKY_CODE_CHANGE_DIR"
+    fi
     if [[ ! -d "$FIXED_DIR" ]]; then
-        create_folder_with_patch "$FLAKY_DIR" "$FIXED_PATCH" "$FIXED_DIR"
+        create_folder_with_patch "$FIXED_BASE_SRC" "$FIXED_PATCH" "$FIXED_DIR"
     fi
 fi
 
@@ -134,6 +154,7 @@ for i in "${!SOURCE_DIRS[@]}"; do
         SRC_DIR="${SOURCE_DIRS[$i]}"
     M2_DIR="${M2_DIRS[$i]}"
     DIR_NAME=$(basename "$SRC_DIR")
+    if [ "$DIR_NAME" = "FlakyCodeChange" ]; then SKIP_COVERAGE=0; else SKIP_COVERAGE=1; fi
     FLAKY_RESULT_DIR="$RESULT_DIR/$DIR_NAME"
     HOST_SRC_ABS="$(readlink -f "$SRC_DIR")"
     HOST_M2_ABS="$(readlink -f "$M2_DIR")"
@@ -147,8 +168,8 @@ for i in "${!SOURCE_DIRS[@]}"; do
     "$PROTO_IMAGE_NAME" \
     tail -f /dev/null
 
-  docker exec -it "$CONTAINER_NAME" /bin/bash -c \
-  "cd /app/source && chmod +x statistics_generator.sh && ./statistics_generator.sh \"$MODULE\" \"$DIR_TO_PYTHON_SCRIPT\" \"$FULL_TEST_NAME\" \"$ITERATIONS\""
+  docker exec -i "$CONTAINER_NAME" /bin/bash -c \
+  "cd /app/source && chmod +x statistics_generator.sh && SKIP_COVERAGE=$SKIP_COVERAGE ./statistics_generator.sh \"$MODULE\" \"$DIR_TO_PYTHON_SCRIPT\" \"$FULL_TEST_NAME\" \"$ITERATIONS\""
 
     mkdir -p "$FLAKY_RESULT_DIR"
     cp -a "$SRC_DIR/flaky-result/." "$FLAKY_RESULT_DIR/"

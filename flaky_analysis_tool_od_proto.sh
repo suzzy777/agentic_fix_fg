@@ -175,6 +175,7 @@ for i in "${!SOURCE_DIRS[@]}"; do
     CURRENT_PRECEDING_TEST="${PRECEDING_TESTS[$i]}"
     CURRENT_FLAKY_TEST="${FLAKY_TESTS[$i]}"
     DIR_NAME=$(basename "$SRC_DIR")
+    if [ "$DIR_NAME" = "Flaky" ]; then SKIP_COVERAGE=0; else SKIP_COVERAGE=1; fi
     FLAKY_RESULT_DIR="$RESULT_DIR/$DIR_NAME"
     HOST_SRC_ABS="$(readlink -f "$SRC_DIR")"
     HOST_M2_ABS="$(readlink -f "$M2_DIR")"
@@ -187,7 +188,7 @@ for i in "${!SOURCE_DIRS[@]}"; do
     --mount type=bind,source="$HOST_M2_ABS",target=/root/.m2 \
     "$PROTO_IMAGE_NAME" \
     tail -f /dev/null
-    docker exec -i $CONTAINER_NAME /bin/bash -c "cd /app/source && chmod +x od_statistics_generator.sh && ./od_statistics_generator.sh \"$MODULE\" \"$CURRENT_PRECEDING_TEST\" \"$CURRENT_FLAKY_TEST\" \"$ITERATIONS\""
+    docker exec -i $CONTAINER_NAME /bin/bash -c "cd /app/source && chmod +x od_statistics_generator.sh && SKIP_COVERAGE=$SKIP_COVERAGE ./od_statistics_generator.sh \"$MODULE\" \"$CURRENT_PRECEDING_TEST\" \"$CURRENT_FLAKY_TEST\" \"$ITERATIONS\""
     mkdir -p "$FLAKY_RESULT_DIR"
     cp -a "$SRC_DIR/flaky-result/." "$FLAKY_RESULT_DIR/"
     docker stop $CONTAINER_NAME

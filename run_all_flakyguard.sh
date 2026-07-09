@@ -15,12 +15,15 @@ fi
 
 printf 'issue_id,status,exit_code,log_file,working_patch,saved_working_patch\n' > "$SUMMARY_FILE"
 
-while IFS= read -r issue_id; do
+while IFS=, read -r test_type issue_id; do
+    test_type="${test_type//$'\r'/}"
     issue_id="${issue_id//$'\r'/}"
     [[ -n "$issue_id" ]] || continue
 
+    safe_type=$(printf '%s' "$test_type" | tr -cs '[:alnum:]' '_')
+    [[ -n "$safe_type" ]] || safe_type="run"
     safe_issue_id=$(printf '%s' "$issue_id" | tr -cs '[:alnum:]_.-' '_')
-    log_file="id_${safe_issue_id}.log"
+    log_file="${safe_type}_${safe_issue_id}.log"
 
     echo "============================================================"
     echo "Running issue: $issue_id"
@@ -64,11 +67,10 @@ while IFS= read -r issue_id; do
         "$issue_id" "$status" "$exit_code" "$log_file" "$working_patch" "$saved_working_patch" \
         >> "$SUMMARY_FILE"
 
-done < <(tail -n +2 "$CSV_FILE" | cut -d, -f2)
+done < <(tail -n +2 "$CSV_FILE" | cut -d, -f1,2)
 
 echo
 echo "Finished processing all issues."
 echo "Summary: $SUMMARY_FILE"
 echo "Successful patches: $SUCCESS_PATCH_DIR"
-
 

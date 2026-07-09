@@ -101,6 +101,7 @@ for i in "${!SOURCE_DIRS[@]}"; do
     SRC_DIR="${SOURCE_DIRS[$i]}"
     M2_DIR="${M2_DIRS[$i]}"
     DIR_NAME=$(basename "$SRC_DIR")
+    if [ "$DIR_NAME" = "Flaky" ]; then SKIP_COVERAGE=0; else SKIP_COVERAGE=1; fi
     FLAKY_RESULT_DIR="$RESULT_DIR/$DIR_NAME"
     HOST_SRC_ABS="$(readlink -f "$SRC_DIR")"
     HOST_M2_ABS="$(readlink -f "$M2_DIR")"
@@ -116,7 +117,7 @@ for i in "${!SOURCE_DIRS[@]}"; do
     tail -f /dev/null
 
   docker exec -i "$CONTAINER_NAME" /bin/bash -c \
-  "cd /app/source && chmod +x id_statistics_generator_17.sh && ./id_statistics_generator_17.sh \"$MODULE\" \"$FULL_TEST_NAME\" \"$ITERATIONS\" \"$NONDEXSEED\""
+  "cd /app/source && chmod +x id_statistics_generator_17.sh && SKIP_COVERAGE=$SKIP_COVERAGE ./id_statistics_generator_17.sh \"$MODULE\" \"$FULL_TEST_NAME\" \"$ITERATIONS\" \"$NONDEXSEED\""
     mkdir -p "$FLAKY_RESULT_DIR"
     cp -a "$SRC_DIR/flaky-result/." "$FLAKY_RESULT_DIR/"
     docker stop $CONTAINER_NAME
