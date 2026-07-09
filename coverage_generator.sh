@@ -33,7 +33,6 @@ MVNOPTIONS="-Ddependency-check.skip=true -Dgpg.skip=true -DfailIfNoTests=false \
 -Dwarbucks.skip -Dmodernizer.skip -Dimpsort.skip -Dmdep.analyze.skip -Dpgpverify.skip \
 -Dxml.skip -Dcobertura.skip=true -Dfindbugs.skip=true"
 
-# nio mode mirrors nio_statistics_generator.sh
 CHECKSTYLE_OPTS="-P!checkstyle -Dcheckstyle.skipExec=true -Dmaven.checkstyle.skip=true -DskipCheckstyle=true \
 -Dcheckstyle.config.location=google_checks.xml -Dcheckstyle.failsOnError=false -Dspotless.skip=true -Dskip.format=true"
 
@@ -75,8 +74,6 @@ if [[ "$mode" == "id" && -n "$extra" ]]; then
     seed_param="-DnondexSeed=$extra"
 fi
 
-# Run the test once with the JaCoCo agent attached, using the same
-# failure-triggering command as the matching statistics generator.
 run_with_agent() {
   local destfile="$1"
   case "$mode" in
@@ -111,8 +108,6 @@ run_with_agent() {
   esac
 }
 
-# Fallback when direct agent injection produced no exec file: bind the agent
-# through jacoco:prepare-agent instead, keeping the mode-specific goals.
 run_fallback() {
   case "$mode" in
     od)
@@ -143,8 +138,7 @@ run_fallback() {
         $MVNOPTIONS
       ;;
     *)
-      # nio has no prepare-agent equivalent (testrunner builds its own JVM
-      # command line and ignores argLine), so fall back to a plain single run.
+ 
       mvn -q -Dmaven.repo.local=/root/.m2/repository \
         -pl "$module" -am \
         org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent \
@@ -195,7 +189,6 @@ if [[ "$mode" == "id" && -d "$module/.nondex" ]]; then
     rm -rf "$module/.nondex"
 fi
 
-# If your parser produces a CSV, move it
 if [[ -f "coverage_results.csv" ]]; then
   mv coverage_results.csv flaky-result/
 fi
