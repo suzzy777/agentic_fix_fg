@@ -24,13 +24,10 @@ for line in "${csv_lines[@]}"; do
         continue
     fi
 
-    if [[ -z "${FLAKYGUARD_CODE_VERSION:-}" ]]; then
-        safe_type=$(printf '%s' "$test_type" | tr -cs '[:alnum:]' '_')
-        [[ -n "$safe_type" ]] || safe_type="run"
-        safe_issue_id=$(printf '%s' "$issue_id" | tr -cs '[:alnum:]_.-' '_')
-        exec > >(tee "${safe_type}_${safe_issue_id}.log") 2>&1
-    fi
-
+    # FlakyGuard reproduction should only reproduce the original flaky run.
+    # The CSV may say config=All and iterations=100, which makes OD helpers run
+    # Flaky, Fixed, FlakyPssingOrder, and FixedPssingOrder. That is useful for
+    # full ReproFlake statistics, but too slow for FlakyGuard step [1/3].
     CSV_ITERATIONS="$iterations"
     CSV_CONFIG="$config"
     if [[ -n "${FLAKYGUARD_REPRO_ITERATIONS:-}" ]]; then

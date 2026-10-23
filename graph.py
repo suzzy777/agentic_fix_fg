@@ -1,3 +1,21 @@
+"""
+analysis/graph.py – static call-graph builder using tree-sitter.
+
+Builds a lightweight call graph: for each function definition in scope,
+record what functions it calls (callees) and what calls it (callers).
+
+This is the static-analysis backbone used when a dynamic call graph
+(from instrumented test runs) is not available.  The paper shows that
+a dynamic call graph reduces noise by ~60%; the static version here is
+the correct baseline for research comparisons.
+
+Usage:
+    builder = CallGraphBuilder(repo_root, files_in_scope, language="go")
+    graph   = builder.build()
+    callees = graph.get_callees("AddProgram")
+    callers = graph.get_callers("ValidateIdentity")
+"""
+
 from __future__ import annotations
 import os
 import re
@@ -6,6 +24,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
 class FuncDef:
@@ -47,6 +68,8 @@ class CallGraph:
     def get_def(self, func_name: str) -> list[FuncDef]:
         return self.definitions.get(func_name, [])
 
+
+# ── Tree-sitter helpers ───────────────────────────────────────────────────────
 
 # Node types that represent function definitions per language
 _FUNC_DEF_TYPES = {

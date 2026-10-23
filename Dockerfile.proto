@@ -1,0 +1,18 @@
+FROM flaky_base_jdk8
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y wget tar make g++ && apt-get clean
+
+RUN apt-get update && \
+    apt-get install -y xmlstarlet && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v2.5.0/protobuf-2.5.0.tar.gz && \
+    tar -xzf protobuf-2.5.0.tar.gz && \
+    cd protobuf-2.5.0 && \
+    ./configure && make && make install && ldconfig && \
+    cd .. && rm -rf protobuf-2.5.0 protobuf-2.5.0.tar.gz
+
+CMD ["/bin/bash"]
+

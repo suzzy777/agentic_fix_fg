@@ -57,13 +57,23 @@ if [ -d "$RESULT_DIR" ]; then
     rm -rf "$RESULT_DIR"
 fi
 
+# Both helpers print "Failed to apply patch ..." and return non-zero when
+# `patch` fails, including a partial application (some hunks rejected).
+# runner.py keys on that message to reject a candidate as "did not apply".
+apply_patch_in_place() {
+    local target_dir="$1" patch_file="$2"
+    patch -p1 -d "$target_dir" < "$patch_file" \
+        || { echo "Failed to apply patch $patch_file to $target_dir"; return 1; }
+}
+
 create_folder_with_patch() {
     BASE_DIR=$1
     PATCH_FILE=$2
     TARGET_DIR=$3
+    echo "Creating folder: $TARGET_DIR using patch: $PATCH_FILE..."
     rm -rf "$TARGET_DIR"
-    cp -r "$BASE_DIR" "$TARGET_DIR"
-    patch -p1 -d "$TARGET_DIR" < "$PATCH_FILE"
+    cp -r "$BASE_DIR" "$TARGET_DIR" || { echo "Failed to copy $BASE_DIR to $TARGET_DIR"; return 1; }
+    apply_patch_in_place "$TARGET_DIR" "$PATCH_FILE"
 }
 
 if [[ "$CODE_VERSION" == "All" || "$CODE_VERSION" == "FlakyCodeChange" ]]; then
@@ -80,20 +90,22 @@ if [ -d "$FLAKY_CODE_CHANGE_DIR" ]; then
 fi
 
 if [[ "$CODE_VERSION" == "All" || "$CODE_VERSION" == "Fixed" ]]; then
-    # For TD candidate validation, runner.py sets FLAKYGUARD_FIXED_BASE so the
-    # patched code is built on the sleep-injected FlakyCodeChange copy —
-    # otherwise the flake cannot manifest and validation passes trivially.
-    FIXED_BASE_SRC="$FLAKY_DIR"
-    if [[ "${FLAKYGUARD_FIXED_BASE:-}" == "FlakyCodeChange" ]]; then
-        if [[ ! -d "$FLAKY_CODE_CHANGE_DIR" ]]; then
-            create_folder_with_patch "$FLAKY_DIR" "$FLAKY_CODE_CHANGE_PATCH" "$FLAKY_CODE_CHANGE_DIR"
-        fi
-        cp jacocoagent.jar jacococli.jar coverage_generator.sh modify_pom_for_coverage.sh statistics_generator.sh "$FLAKY_CODE_CHANGE_DIR/" 2>/dev/null || true
-        cp -r python-scripts "$FLAKY_CODE_CHANGE_DIR/" 2>/dev/null || true
-        FIXED_BASE_SRC="$FLAKY_CODE_CHANGE_DIR"
-    fi
     if [[ ! -d "$FIXED_DIR" ]]; then
-        create_folder_with_patch "$FIXED_BASE_SRC" "$FIXED_PATCH" "$FIXED_DIR"
+        if [[ "${FLAKYGUARD_FIXED_BASE:-}" == "FlakyCodeChange" ]]; then
+            # TD candidate validation (runner.py sets FLAKYGUARD_FIXED_BASE):
+            # the flake only manifests on the sleep-injected code, so the
+            # validated tree is Flaky + candidate + FlakyCodeChange.patch.
+            # The candidate was authored against plain Flaky, so it goes on
+            # first (exact match); the sleep patch's one-line insertions then
+            # tolerate the offsets far better than the candidate would.
+            # Any failure of either patch is reported so runner.py rejects the
+            # candidate as "did not apply" instead of testing a half-patched tree.
+            create_folder_with_patch "$FLAKY_DIR" "$FIXED_PATCH" "$FIXED_DIR" \
+                && apply_patch_in_place "$FIXED_DIR" "$FLAKY_CODE_CHANGE_PATCH" \
+                || echo "Failed to apply patch: could not build $FIXED_DIR = Flaky + candidate + FlakyCodeChange.patch"
+        else
+            create_folder_with_patch "$FLAKY_DIR" "$FIXED_PATCH" "$FIXED_DIR"
+        fi
     fi
 fi
 

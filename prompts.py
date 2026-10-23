@@ -1,41 +1,97 @@
+"""
+core/prompts.py – prompt utilities for FlakyGuard Simple.
+
+The paper-style flow uses two prompt stages:
+  1. a high-level thought/root-cause/fixing-plan prompt
+  2. a concrete SEARCH/REPLACE patch prompt conditioned on that thought
+"""
+
 from __future__ import annotations
 
 
+# Flaky-test root-cause category, sourced from test_config.csv's first
+# column (test_type) via TestInput.category. The category description the
+# LLM sees here is kept consistent with the one used elsewhere in this
+# project's tooling.
+#
+# Keys are verified against this project's own real test_config.csv files
+# and its dispatch code (jacoco_coverage.py/runner.py/single_runner.sh)
+# -- notably "britle" (misspelled, no second
+# "t") is the actual value used in this project's data and code, not
+# "brittle". "raft" is a category this project's dispatch code supports
+# but that doesn't appear in any test_config.csv on disk yet; its
+# description here is our own inference (no AgentFlake exemplar exists for
+# it), since it isn't Java-iteration/order/timing in the usual sense --
+# it shows up on Raft-consensus code (e.g. leader election/log
+# replication), so treat it as a distinct, protocol-specific case.
+CATEGORY_DESCRIPTIONS = {
+    "od": "OD (Order-Dependent — a polluter test corrupts shared state)",
+    "td": "TD (Timing-Dependent — race, async, or non-deterministic source)",
+    "id": "ID (Implementation-Dependent — relies on JVM iteration order)",
+    "nio": "NIO (Non-Idempotent-Outcome — self-pollutes across same-JVM invocations)",
+    # Keyed as "britle" to match the misspelling actually used in this
+    # project's test_config.csv data and dispatch code, but displayed with
+    # the correct spelling since this text is what the LLM/humans read.
+    "britle": (
+        "Brittle (Order-Dependent variant — polluter corrupts shared state; "
+        "structurally identical to OD)"
+    ),
+    "raft": (
+        "Raft (Consensus/distributed-coordination flakiness — timing or state "
+        "issues specific to Raft leader-election or log-replication code; "
+        "diagnose as a timing/coordination issue scoped to the consensus "
+        "protocol, not generic JVM ordering)"
+    ),
+    "unclassified": (
+        "Unclassified (root cause unknown — no category-specific guidance "
+        "is available; diagnose from code and error logs alone)"
+    ),
+}
+
+
+def describe_category(category: str | None) -> str:
+    """Return a human-readable description for a test_config.csv category code."""
+    if not category:
+        return "Unknown (no category provided — diagnose from code and error logs alone)"
+    key = category.strip().lower()
+    return CATEGORY_DESCRIPTIONS.get(key, category)
+
+
 DEFAULT_BEST_PRACTICES = """\
-## Guidelines for Repairing Flaky Tests
+## Best Practices for Fixing Flaky Tests
 
-### Keeping the code healthy
-- Match the conventions and idioms already used in the surrounding code.
-- Reach for helpers and libraries the project already depends on.
-- Cover edge cases and handle errors rather than ignoring them.
-- Give variables and functions names that explain themselves.
-- Comment only where the intent would otherwise be unclear.
+### Code Quality Standards
+- Follow existing code conventions and patterns in the codebase.
+- Use existing libraries and utilities when available.
+- Ensure proper error handling and edge case coverage.
+- Write clear, descriptive variable and function names.
+- Add meaningful comments only when necessary to explain complex logic.
 
-### Keeping the tests reliable
-- Favour deterministic constructs over anything time- or order-sensitive.
-- Keep each test self-contained; never lean on shared or leftover state.
-- Release whatever the test acquires, in setup/teardown as appropriate.
-- Inject or mock anything external so its behaviour is under your control.
+### Testing Best Practices
+- Prefer deterministic test patterns over time-dependent or order-dependent logic.
+- Ensure test isolation; tests should not depend on external state or other tests.
+- Clean up resources properly in test setup or teardown.
+- Use dependency injection and mocking to control external dependencies.
 """
 
 
 SEARCH_REPLACE_FORMAT = """\
-## Output Contract
+## Required Output Format
 
-Emit your edits as one or more SEARCH/REPLACE blocks. Each block is laid out
-exactly like this:
+# SEARCH/REPLACE block Rules:
 
-- Line 1: the complete file path on its own, raw text only (no quoting, no
-  bold, no escaping).
-- Line 2: an opening fence with the language tag, e.g. ```java
-- Line 3: the search marker `<<<<<<< SEARCH`
-- Then: the exact existing lines you want to locate.
-- Then: the divider `=======`
-- Then: the replacement lines.
-- Then: the replace marker `>>>>>>> REPLACE`
-- Last line: the closing fence ```
+Every SEARCH/REPLACE block must use this format:
 
-Worked example:
+1. The FULL file path alone on a line, verbatim. No bold asterisks, no quotes around it, no escaping of characters.
+2. The opening fence and code language, e.g. ```java
+3. The start of search block: <<<<<<< SEARCH
+4. A contiguous chunk of lines to search for in the existing source code.
+5. The dividing line: =======
+6. The lines to replace into the source code.
+7. The end of the replace block: >>>>>>> REPLACE
+8. The closing fence: ```
+
+Example:
 
 src/test/java/MyTest.java
 ```java
@@ -46,45 +102,111 @@ src/test/java/MyTest.java
 >>>>>>> REPLACE
 ```
 
-Rules to respect:
-- The SEARCH region must reproduce the current file byte for byte — same
-  comments, whitespace, indentation and line breaks.
-- Only the first match of each SEARCH region is rewritten.
-- Split unrelated changes across separate blocks; keep each block small and
-  give it enough surrounding lines to match uniquely.
-- Never use ellipses (..., [...]) or partial code inside a SEARCH region.
-- Only patch files that appear in the provided context.
-- Edit the test rather than production code unless the production code is
-  clearly at fault.
-- Put no prose before the blocks.
+Every SEARCH section must EXACTLY MATCH the existing file content, character for character, including comments, spaces, indentation, and line breaks.
 
-## Explanation Contract
+SEARCH/REPLACE blocks replace only the first matching occurrence.
+Use multiple SEARCH/REPLACE blocks if needed.
 
-Once the blocks are done, add a short note inside EXPLANATION tags:
+Keep SEARCH/REPLACE blocks concise.
+Break large edits into smaller blocks.
+Include enough lines in each SEARCH section to uniquely match the code.
+
+Only create SEARCH/REPLACE blocks for files that are provided in the prompt/context.
+Prefer editing tests, not production code, unless production code is clearly necessary.
+
+Do not include ellipses (...), [...], or incomplete code in SEARCH blocks.
+Do not put explanations before the SEARCH/REPLACE blocks.
+
+## Explanation Format
+
+After all SEARCH/REPLACE blocks, include a brief explanation wrapped in EXPLANATION tags:
 
 ```
 <EXPLANATION>
-One or two sentences on the cause of the flakiness and how the patch removes it.
+Brief explanation of what was causing the flakiness and how the fix addresses it.
 </EXPLANATION>
 ```
 """
 
 
-# Shared evidence block so the two stages stay in sync.
-_EVIDENCE_TEMPLATE = """\
-## Evidence
+def get_flaky_test_thought_prompt(
+    simplified_test_code: str,
+    original_test_code: str,
+    assertion_failures: str,
+    error_trace: str,
+    code_context: str,
+    language: str,
+    context_attempt: int = 1,
+    thought_attempt: int = 1,
+    total_thoughts: int = 1,
+    best_practices: str | None = None,
+    failed_thoughts: list[str] | None = None,
+    category: str | None = None,
+    polluter: str | None = None,
+) -> str:
+    """
+    Generate the paper-style high-level thought prompt.
 
-**Reduced test (reference only, to show the shape of the test):**
+    The response should identify the root-cause category, explain why the
+    failure is flaky, and propose a fixing plan. It should not produce code
+    edits yet.
+    """
+    best_practices_text = best_practices or DEFAULT_BEST_PRACTICES
+
+    failed_thoughts_section = ""
+
+    if failed_thoughts:
+        failed_thoughts_text = "\n\n".join(
+            f"Failed thought {index + 1}:\n{thought}"
+            for index, thought in enumerate(failed_thoughts)
+        )
+
+        failed_thoughts_section = f"""
+## Previously Attempted Thoughts That Failed
+
+The following strategies did not produce a valid fix:
+
+{failed_thoughts_text}
+
+Do not repeat the same root cause or fixing strategy.
+Propose a substantially different explanation or plan.
+"""
+        
+    category_line = f"**Category:** {describe_category(category)}\n\n" if category else ""
+    polluter_line = f"**Polluter (runs immediately before the victim):** {polluter}\n\n" if polluter else ""
+
+    if category:
+        category_guidance = (
+            f"This test's category is already known: {describe_category(category)}. "
+            "Do not re-derive the category from scratch -- state it directly and spend "
+            "your analysis on the SPECIFIC mechanism (which field, collection, singleton, "
+            "or timing source is involved) and the fixing plan."
+        )
+        category_output_hint = f"Root-cause category: {describe_category(category)}"
+    else:
+        category_guidance = ""
+        category_output_hint = "Root-cause category: ..."
+
+    return f"""You are an expert at diagnosing flaky tests in {language}.
+This is thought attempt {thought_attempt}/{total_thoughts} for context attempt {context_attempt}.
+
+Your task is to produce a high-level fixing thought/plan only. Do NOT produce SEARCH/REPLACE edits yet.
+
+{best_practices_text}
+
+## Test Analysis
+
+{category_line}{polluter_line}**Simplified test for reference:**
 ```{language}
 {simplified_test_code}
 ```
 
-**Test to repair (edit this one):**
+**Original test to be fixed:**
 ```{language}
 {original_test_code}
 ```
 
-**Failure messages:**
+**Error messages:**
 ```
 {assertion_failures}
 ```
@@ -94,84 +216,30 @@ _EVIDENCE_TEMPLATE = """\
 {error_trace}
 ```
 
-**Surrounding context:**
+**Additional context:**
 ```
 {code_context}
-```"""
+```
 
+## Common Flaky Test Root-Cause Categories
 
-_FLAKY_CATEGORIES = """\
-## Flaky Categories to Consider
+- Timing/race/asynchronous behavior
+- Shared state or polluted global/static state
+- Non-deterministic ordering or order-sensitive assertions
+- Randomness/generated IDs/hash iteration ordering
+- External dependency, filesystem, network, time, locale, or environment dependency
+- Resource cleanup/isolation issue
 
-- Timing, races, sleeps/timeouts, or async work completing in a different order.
-- Leaked or shared mutable state: globals, statics, system properties, env vars,
-  files, DBs, caches, or mocks carried between tests.
-- Order-sensitive assertions or iteration over unordered collections.
-- Randomness: RNGs, UUIDs, generated identifiers, or unstable hash ordering.
-- Other factors: filesystem, network, wall-clock time, locale, or environment.
-- Missing cleanup or isolation between tests."""
+{category_guidance}
 
+{failed_thoughts_section}
 
-def get_flaky_test_thought_prompt(
-    *,
-    simplified_test_code: str, original_test_code: str,
-    assertion_failures: str, error_trace: str, code_context: str,
-    language: str,
-    context_attempt: int = 1, thought_attempt: int = 1, total_thoughts: int = 1,
-    best_practices: str | None = None, failed_thoughts: list[str] | None = None,
-) -> str:
-    """
-    Stage 1 prompt: ask for a diagnosis and a repair plan, but no code edits yet.
+## Required Output
 
-    The reply should name the root-cause category, justify why the failure is
-    non-deterministic, and sketch a minimal, safe fixing plan.
-    """
-    practices = best_practices or DEFAULT_BEST_PRACTICES
-
-    prior_section = ""
-    if failed_thoughts:
-        prior = "\n\n".join(
-            f"Rejected plan {n + 1}:\n{body}"
-            for n, body in enumerate(failed_thoughts)
-        )
-        prior_section = f"""
-## Plans Already Tried Without Success
-
-These strategies did not yield a working fix:
-
-{prior}
-
-Do not restate the same root cause or plan — offer a materially different one.
-"""
-
-    evidence = _EVIDENCE_TEMPLATE.format(
-        language=language,
-        simplified_test_code=simplified_test_code,
-        original_test_code=original_test_code,
-        assertion_failures=assertion_failures,
-        error_trace=error_trace,
-        code_context=code_context,
-    )
-
-    return f"""You are a specialist in diagnosing flaky {language} tests.
-You are on thought {thought_attempt} of {total_thoughts} for context round {context_attempt}.
-
-Produce only a high-level diagnosis and repair plan. Do NOT write SEARCH/REPLACE edits at this stage.
-
-{practices}
-
-{evidence}
-
-{_FLAKY_CATEGORIES}
-
-{prior_section}
-
-## Deliverable
-
-Return one plan, formatted exactly as:
+Return exactly one high-level thought using this structure:
 
 <THOUGHT>
-Root-cause category: ...
+{category_output_hint}
 Root-cause explanation: ...
 Fixing plan: ...
 Why this plan is minimal and safe: ...
@@ -179,71 +247,141 @@ Why this plan is minimal and safe: ...
 """
 
 
-def render_flaky_repair_prompt(
-    *,
-    simplified_test_code: str, original_test_code: str,
-    assertion_failures: str, error_trace: str, code_context: str,
-    language: str, output_format: str,
-    thought: str | None = None, best_practices: str | None = None,
+def get_flaky_test_fixing_prompt(
+    simplified_test_code: str,
+    original_test_code: str,
+    assertion_failures: str,
+    error_trace: str,
+    code_context: str,
+    language: str,
+    output_format: str,
+    best_practices: str | None = None,
+    thought: str | None = None,
+    category: str | None = None,
+    polluter: str | None = None,
 ) -> str:
     """
-    Stage 2 prompt: turn the diagnosis into a concrete SEARCH/REPLACE patch.
+    Generate a comprehensive prompt for fixing flaky tests.
 
-    Supplies the same evidence block as stage 1, plus a checklist of common
-    failure modes, the plan to follow, and the required output contract.
+    This follows the original FlakyGuard prompt structure:
+    simplified test, original test, error messages, stack trace, additional
+    context, common flaky-test patterns, fixing strategy, output format, and
+    required output.
     """
-    practices = best_practices or DEFAULT_BEST_PRACTICES
-    plan = thought or (
-        "No explicit plan was supplied. Work out the most likely root cause "
-        "and a minimal fixing plan before you edit."
-    )
+    best_practices_text = best_practices or DEFAULT_BEST_PRACTICES
+    thought_text = thought or "No separate thought was provided. Infer the most likely root cause and fixing plan before editing."
+    category_line = f"**Category:** {describe_category(category)}\n\n" if category else ""
+    polluter_line = f"**Polluter (runs immediately before the victim):** {polluter}\n\n" if polluter else ""
 
-    evidence = _EVIDENCE_TEMPLATE.format(
-        language=language,
-        simplified_test_code=simplified_test_code,
-        original_test_code=original_test_code,
-        assertion_failures=assertion_failures,
-        error_trace=error_trace,
-        code_context=code_context,
-    )
+    return f"""You are an expert at fixing flaky tests in {language}. Your goal is to identify and fix the root cause of non-deterministic test behavior.
 
-    return f"""You are a specialist in repairing flaky {language} tests. Find the root cause of the non-deterministic behaviour and eliminate it.
+{best_practices_text}
 
-{practices}
+## Test Analysis
 
-{evidence}
+{category_line}{polluter_line}**Simplified test for reference (to help you understand the structure):**
+```{language}
+{simplified_test_code}
+```
 
-{_FLAKY_CATEGORIES}
+**Original test to be fixed:**
+```{language}
+{original_test_code}
+```
 
-## How to Fix
+**Error messages:**
+```
+{assertion_failures}
+```
 
-1. Read the failure and spot the non-deterministic signal.
-2. Pin down the category (timing, state, ordering, randomness, external, ...).
-3. Apply a targeted fix, e.g.:
-   - sort/normalise before comparing,
-   - use fixed, deterministic data,
-   - reset or isolate state,
-   - add the synchronisation that is missing,
-   - mock or pin the non-deterministic dependency.
-4. Change the specific failing case rather than shared setup where you can.
-5. Prefer fixing the test over the code under test, unless the code under test
-   is genuinely buggy.
+**Stack trace:**
+```
+{error_trace}
+```
 
-## Plan to Follow
+**Additional context:**
+```
+{code_context}
+```
 
-Treat the following as the plan for this patch:
+## Common Flaky Test Patterns to Look For
+
+1. **Timing Issues**: Race conditions, asynchronous work finishing in different orders, or tests relying on sleeps/timeouts
+2. **Shared State**: Global/static variables, system properties, environment variables, files, databases, caches, or mocks shared between tests
+3. **Non-deterministic Ordering**: Iteration over unordered collections, order-sensitive assertions, or assumptions about execution order
+4. **Non-deterministic Algorithms**: Random number generation, UUID generation, generated IDs, or data structures with unstable ordering
+5. **External Dependencies**: Network calls, file system behavior, time-dependent code, or resource cleanup issues
+
+## Fixing Strategy
+
+1. **Analyze the error**: Look for patterns indicating non-deterministic behavior
+2. **Identify the root cause**: Timing, shared state, ordering, randomness, external dependency, etc.
+3. **Apply appropriate fix**:
+   - Make ordering deterministic before comparison
+   - Use deterministic test data
+   - Isolate or reset test state
+   - Add proper synchronization
+   - Mock or control non-deterministic dependencies
+
+4. **Focus on the specific failing test case** rather than modifying shared setup
+5. **Fix the test logic instead of the code under test, unless you strongly believe that the code under test is buggy.**
+
+## High-Level Thought / Fixing Plan to Follow
+
+Use the following thought as the plan for this concrete patch attempt:
 
 ```
-{plan}
+{thought_text}
 ```
 
 {output_format}
 
-## Deliverable
+## Required Output
 
-Work through the failure and return:
+Please analyze the test failure and provide:
 
-1. The edits, in the SEARCH/REPLACE format above - search against the original
-   test function.
-2. A short note in EXPLANATION tags when using the combined format.
+1. **The necessary fixes** using the SEARCH/REPLACE format above, note the search should be with respect to the original test function.
+2. **A brief explanation** wrapped in EXPLANATION tags if using the combined format.
+"""
+
+
+def get_build_error_fix_prompt(
+    defects_text: str,
+    language: str,
+    current_content: str,
+    original_content_hint: str,
+) -> str:
+    """
+    Generate a prompt for the compilation-retry step.
+
+    Mirrors original FlakyGuard's build-error-fixing prompt
+    (flakyguard/utils/fix_build_errors.py::get_prompt_for_fixing_build_errors):
+    a previous flaky-test fix broke the build, so give the LLM the compiler
+    diagnostics plus both the current (broken) file content and the original
+    (pre-fix, previously-compiling) file content as reference, and ask for
+    minimal SEARCH/REPLACE edits that resolve only the compilation errors.
+    """
+    return f"""You are an expert at fixing compilation errors in {language}. A previous edit made to fix a flaky test broke the build. Your goal is to make the minimum change necessary to resolve the compiler errors below, without undoing the intentional behavior change that fixed the flakiness.
+
+## Compiler Errors To Fix
+
+{defects_text}
+
+{current_content}
+
+{original_content_hint}
+
+## Instructions
+
+1. Analyze each compiler error and locate its cause in the current (broken) code shown above.
+2. Fix missing/incorrect imports, syntax errors, type errors, or references to symbols that were renamed or removed by the previous edit.
+3. If the original (pre-fix) code is shown above, use it only as a reference for what previously compiled — do not revert the behavior change that was made to address the flaky test, just repair the compile error.
+4. Make minimal changes: only touch what is necessary to fix the compiler errors listed above.
+5. The SEARCH text must match the CURRENT (broken) file content shown above, not the original.
+
+{SEARCH_REPLACE_FORMAT}
+
+## Required Output
+
+Provide SEARCH/REPLACE edits that fix all compilation errors listed above, followed by a brief EXPLANATION.
 """

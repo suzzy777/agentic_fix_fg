@@ -1,3 +1,11 @@
+"""
+utils/runner.py – reproduce and validate flaky tests.
+
+Reproduction uses the ReproFlake single_runner.sh + test_config.csv workflow.
+Validation applies the generated patch to the artifact's Flaky version and
+reruns the same helper-script logic with CODE_VERSION=Fixed.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -9,8 +17,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import threading
-import time
 import zipfile
 from pathlib import Path
 
@@ -56,70 +62,6 @@ def _timeout_text(value) -> str:
     return str(value)
 
 
-def _parse_script_summary(output: str) -> tuple[int, int, int] | None:
-    blocks = re.findall(
-        r"Passes:\s*(\d+)\s*\n\s*Failures:\s*(\d+)\s*\n\s*Errors:\s*(\d+)", output
-    )
-    if not blocks:
-        return None
-    best = max(blocks, key=lambda b: int(b[1]) + int(b[2]))
-    return int(best[0]), int(best[1]), int(best[2])
-
-_PROGRESS_LINE_RE = re.compile(
-    r"INSIDE COVERAGE GENERATOR"
-    r"|^Summary:|^Passes:|^Failures:|^Errors:"
-    r"|Jacoco exec not found"
-    r"|Failed to apply patch"
-    r"|skipping coverage generation"
-    r"|Failed to patch .*pom"
-)
-
-
-def _run_script_streaming(cmd: str, cwd: str, timeout, env) -> tuple[int, str]:
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        bufsize=1,
-    )
-    chunks: list[str] = []
-
-    def _pump() -> None:
-        for line in proc.stdout:
-            chunks.append(line)
-            if _PROGRESS_LINE_RE.search(line):
-                logger.info("[repro] %s", line.rstrip())
-
-    reader = threading.Thread(target=_pump, daemon=True)
-    reader.start()
-
-    start = time.monotonic()
-    while True:
-        remaining = None if timeout is None else timeout - (time.monotonic() - start)
-        if remaining is not None and remaining <= 0:
-            proc.kill()
-            proc.wait()
-            reader.join(timeout=5)
-            raise subprocess.TimeoutExpired(cmd, timeout, output="".join(chunks))
-        try:
-            proc.wait(timeout=60.0 if remaining is None else min(60.0, remaining))
-            break
-        except subprocess.TimeoutExpired:
-            logger.info(
-                "[repro] ... still running (%.0f min elapsed, %d output lines so far)",
-                (time.monotonic() - start) / 60.0,
-                len(chunks),
-            )
-
-    reader.join(timeout=5)
-    return proc.returncode, "".join(chunks)
-
-
 def _safe_rmtree(path: Path) -> None:
     """Remove a directory, fixing Docker-created permissions when possible."""
     if not path.exists():
@@ -137,6 +79,8 @@ def _safe_rmtree(path: Path) -> None:
     except PermissionError:
         pass
 
+    # Docker helpers often create root-owned files in bind mounts. Use Docker to
+    # chown the mounted directory back to the current user if Docker is available.
     try:
         subprocess.run(
             [
@@ -157,12 +101,12 @@ def _safe_rmtree(path: Path) -> None:
 
 def _script_repro_iterations() -> int:
     """Iterations for script-based reproduction only. Keep this small/fast."""
-    raw = os.environ.get("FLAKYGUARD_REPRO_ITERATIONS", "10")
+    raw = os.environ.get("FLAKYGUARD_REPRO_ITERATIONS", "1")
     try:
         return max(1, int(raw))
     except ValueError:
-        logger.warning("Invalid FLAKYGUARD_REPRO_ITERATIONS=%r; using 10.", raw)
-        return 10
+        logger.warning("Invalid FLAKYGUARD_REPRO_ITERATIONS=%r; using 1.", raw)
+        return 1
 
 
 # ── Failure parsing ──────────────────────────────────────────────────────────
@@ -231,17 +175,54 @@ def _parse_python_failure(output: str) -> FlakyInfo | None:
     return FlakyInfo(error=error, error_trace=failure_section or output[:1000], error_file=error_file, error_line=error_line)
 
 
-def _parse_java_failure(output: str) -> FlakyInfo | None:
-    failure_markers = (
-        "<<< FAILURE!",
-        "AssertionFailedError",
-        "AssertionError",
-        "Tests run:",
-        "There are test failures",
-        "FAILURE",
-        "ERROR",
+# Patterns that indicate a real test failure. Deliberately excludes bare
+# substrings such as "Tests run:", "FAILURE", or "ERROR": every Maven run
+# prints "Tests run: 1, Failures: 0" and NonDex prints
+# "No Test Failed with this configuration." on a clean pass, and those used
+# to be mis-classified as a reproduced failure.
+_JAVA_FAILURE_PATTERNS = (
+    r"<<< (?:FAILURE|ERROR)!",
+    r"AssertionFailedError",
+    r"AssertionError",
+    r"ComparisonFailure",
+    r"There are test failures",
+    r"There were test failures",
+    r"COMPILATION ERROR",
+    r"Failed to apply patch",
+    r"Tests run:\s*\d+,\s*Failures:\s*[1-9]",
+    r"Tests run:\s*\d+,\s*Failures:\s*\d+,\s*Errors:\s*[1-9]",
+    r"^\s*Failures:\s*[1-9]",   # ReproFlake summary.txt
+    r"^\s*Errors:\s*[1-9]",     # ReproFlake summary.txt
+    r",\s*(?:failure|error)\s*,",  # ReproFlake rounds-test-results.csv row
+)
+
+
+def _java_output_has_failure(output: str) -> bool:
+    return any(
+        re.search(pattern, output, re.MULTILINE) for pattern in _JAVA_FAILURE_PATTERNS
     )
-    if not any(marker in output for marker in failure_markers):
+
+
+# rounds-test-results.csv rows look like:
+#   1,<execution-id>,933178,<xml-file>,failure,0.541
+# One NonDex seed can span a whole multi-round reproduction run; this finds
+# the seed of the first round that actually failed/errored, so coverage
+# collection can be pointed at a run that exercises the failing code path
+# instead of blindly reusing test_config.csv's (possibly non-failing, in
+# this environment) recorded seed.
+_ROUNDS_CSV_ROW_RE = re.compile(
+    r"^\s*\d+,[^,\n]*,(?P<seed>\d+),[^,\n]*,(?:failure|error)\b", re.MULTILINE
+)
+
+
+def _extract_failing_seed(output: str) -> str:
+    """Return the NonDex seed of the first failing/erroring round, if any."""
+    match = _ROUNDS_CSV_ROW_RE.search(output)
+    return match.group("seed") if match else ""
+
+
+def _parse_java_failure(output: str) -> FlakyInfo | None:
+    if not _java_output_has_failure(output):
         return None
 
     lines = output.splitlines()
@@ -252,7 +233,9 @@ def _parse_java_failure(output: str) -> FlakyInfo | None:
         if (
             "AssertionFailedError" in line
             or "AssertionError" in line
+            or "ComparisonFailure" in line
             or "<<< FAILURE!" in line
+            or "<<< ERROR!" in line
             or re.search(r"expected:.*but was:", line)
         )
     ]
@@ -261,7 +244,12 @@ def _parse_java_failure(output: str) -> FlakyInfo | None:
         error_lines = [
             line.strip()
             for line in lines
-            if "Exception" in line or "Failed" in line or "FAILURE" in line
+            if (
+                "Exception" in line
+                or "BUILD FAILURE" in line
+                or "COMPILATION ERROR" in line
+                or re.search(r"Tests run:.*(?:Failures|Errors):\s*[1-9]", line)
+            )
         ]
 
     error = "\n".join(error_lines[:8]) or output[:500]
@@ -287,6 +275,15 @@ def _zip_stem(zip_path: str) -> str:
 
 
 def _prepare_script_workdir(test_input: TestInput) -> str:
+    """
+    Prepare the directory where single_runner.sh/helper scripts run.
+
+    The workdir must contain:
+      - single_runner.sh
+      - test_config.csv
+      - companion flaky_analysis_tool_*.sh scripts
+      - optional data/<zip>.zip; if missing, single_runner.sh can download it
+    """
     if not test_input.repro_issue_id:
         raise ValueError("--repro-issue-id is required")
 
@@ -627,31 +624,12 @@ def _failure_marker_report(output: str, test_type: str = "") -> str:
     if test_type != "nio":
         patterns.append(r",\s*failure\s*,")
 
-    # matches = []
-    # for line_number, line in enumerate(output.splitlines(), start=1):
-    #     if any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns):
-    #         matches.append(f"{line_number:5}: {line}")
-
-    # return "\n".join(matches) if matches else "<no marker lines found>"
-
-    lines = output.splitlines()
     matches = []
-    seen = set()
-    context = 3  # lines before and after
-
-    for line_number, line in enumerate(lines, start=1):
+    for line_number, line in enumerate(output.splitlines(), start=1):
         if any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns):
-            start = max(0, line_number - 1 - context)
-            end = min(len(lines), line_number + context)
-            for i in range(start, end):
-                if i not in seen:
-                    seen.add(i)
-                    prefix = ">>>" if i == line_number - 1 else "   "
-                    matches.append(f"{prefix} {i+1:5}: {lines[i]}")
-            matches.append("---")
+            matches.append(f"{line_number:5}: {line}")
 
     return "\n".join(matches) if matches else "<no marker lines found>"
-
 
 # def _has_failure_markers(output: str) -> bool:
 #     """Return True if script/test output contains clear failure markers."""
@@ -1024,11 +1002,6 @@ def reproduce_failure(test_input: TestInput) -> FlakyInfo | None:
             logger.error("Script reproduction setup failed: %s", exc)
             return None
 
-        # TD artifacts only manifest the flake in the sleep-injected
-        # FlakyCodeChange copy; every other type reproduces on plain Flaky.
-        test_type = (row.get("test_type") or "").strip().lower()
-        repro_code_version = "FlakyCodeChange" if test_type == "td" else "Flaky"
-
         script_name = os.path.basename(test_input.repro_script)
         cmd = f"bash ./{script_name} {test_input.repro_issue_id}"
 
@@ -1038,47 +1011,47 @@ def reproduce_failure(test_input: TestInput) -> FlakyInfo | None:
             _safe_rmtree(issue_dir)
 
         repro_iterations = _script_repro_iterations()
+        # TD flakes only manifest on the sleep-injected copy, so reproduce there.
+        is_td = (row.get("test_type") or "").strip().lower() == "td"
+        code_version = "FlakyCodeChange" if is_td else "Flaky"
         env = os.environ.copy()
-        env["FLAKYGUARD_CODE_VERSION"] = repro_code_version
+        env["FLAKYGUARD_CODE_VERSION"] = code_version
         env["FLAKYGUARD_REPRO_ITERATIONS"] = str(repro_iterations)
 
         logger.info("Reproducing flaky test with script: %s (cwd=%s)", cmd, workdir)
         logger.info(
             "For FlakyGuard reproduction only, forcing ReproFlake CODE_VERSION=%s and iterations=%d.",
-            repro_code_version,
+            code_version,
             repro_iterations,
         )
 
         try:
-            returncode, output = _run_script_streaming(
+            result = subprocess.run(
                 cmd,
+                shell=True,
                 cwd=workdir,
+                capture_output=True,
+                text=True,
                 timeout=test_input.repro_timeout,
                 env=env,
             )
         except subprocess.TimeoutExpired as exc:
-            output = _timeout_text(exc.stdout) + "\nTIMEOUT"
+            output = _timeout_text(exc.stdout) + _timeout_text(exc.stderr) + "\nTIMEOUT"
             full_output = _collect_repro_logs(workdir, output, test_input.repro_issue_id)
             return FlakyInfo(error="TIMEOUT", error_trace=full_output)
 
+        output = result.stdout + result.stderr
         full_output = _collect_repro_logs(workdir, output, test_input.repro_issue_id)
 
-        # The statistics generator's Summary block is authoritative. Without
-        # this gate, marker-based detection reports success even on all-pass
-        # runs: every Maven log contains "Tests run:" and passing Hadoop test
-        # logs are full of benign ERROR/exception lines.
-        summary = _parse_script_summary(full_output)
-        if summary is not None:
-            passes, failures, errors = summary
+        failing_seed = _extract_failing_seed(full_output)
+        if failing_seed:
+            test_input.repro_failing_seed = failing_seed
             logger.info(
-                "Reproduction summary: Passes=%d Failures=%d Errors=%d",
-                passes, failures, errors,
+                "Reproduction found a failing round at nondexSeed=%s (of %d); "
+                "coverage collection will reuse this seed.",
+                failing_seed,
+                repro_iterations,
             )
-            if failures + errors == 0:
-                logger.warning(
-                    "All reproduction iterations passed - flaky failure NOT reproduced."
-                )
-                return None
 
         info = _extract_flaky_info(full_output, test_input)
         if info:
@@ -1089,15 +1062,22 @@ def reproduce_failure(test_input: TestInput) -> FlakyInfo | None:
             logger.info("Failure reproduced via script summary/results.")
             return FlakyInfo(error="Failure reproduced by script", error_trace=full_output[:4000])
 
-        if returncode != 0:
-            logger.warning("Reproduction script exited with %d but no test failure was parsed.", returncode)
+        if re.search(r"No Test Failed with this configuration", full_output):
+            logger.warning(
+                "NonDex reported 'No Test Failed with this configuration': the test PASSED "
+                "with the given seed. Check nondexSeed/JDK/NonDex version in test_config.csv."
+            )
+
+        if result.returncode != 0:
+            logger.warning("Reproduction script exited with %d but no test failure was parsed.", result.returncode)
             return FlakyInfo(
-                error=f"Reproduction script failed with exit code {returncode}",
+                error=f"Reproduction script failed with exit code {result.returncode}",
                 error_trace=full_output[:4000],
             )
 
-        logger.info("DEBUG script returncode: %s", returncode)
-        logger.info("DEBUG output tail:\n%s", output[-4000:])
+        logger.info("DEBUG script returncode: %s", result.returncode)
+        logger.info("DEBUG stdout tail:\n%s", result.stdout[-4000:])
+        logger.info("DEBUG stderr tail:\n%s", result.stderr[-4000:])
 
         logger.warning("Script completed but no flaky failure was found in output/logs.")
         return None
@@ -1118,13 +1098,25 @@ def reproduce_failure(test_input: TestInput) -> FlakyInfo | None:
     return None
 
 
-def validate_fix(test_input: TestInput, runs: int = 10, patch_path: str | None = None) -> bool:
+def validate_fix_detailed(
+    test_input: TestInput, runs: int = 10, patch_path: str | None = None
+) -> tuple[bool, str]:
     """
-    Validate a generated fix.
+    Validate a generated fix, also returning the raw validation output.
 
     In script mode, apply the generated patch to the artifact's Flaky copy and
-    run the matching helper script with CODE_VERSION=Fixed. The iteration count
-    defaults to 10 through TestInput.script_validation_iterations.
+    run the matching helper script with CODE_VERSION=Fixed. That helper script
+    is what actually builds/tests inside the per-JDK Docker container (see
+    flaky_analysis_tool_id_*.sh: docker run with the source bind-mounted to
+    /app/source, then docker exec ... mvn clean install -pl $MODULE -am ...).
+    Its combined stdout/stderr is returned here so callers can tell a build
+    failure apart from a genuine test failure -- see compile_repair.py, which
+    parses this output for javac/Maven compiler diagnostics after a candidate
+    fix breaks the build, instead of running any separate (and environment-
+    mismatched) build on the host.
+
+    The iteration count defaults to 10 through
+    TestInput.script_validation_iterations.
 
     In command fallback mode, run TestInput.run_cmd `runs` times.
     """
@@ -1137,14 +1129,14 @@ def validate_fix(test_input: TestInput, runs: int = 10, patch_path: str | None =
             helper_path = Path(workdir) / helper
             if not helper_path.is_file():
                 logger.error("Validation helper script not found: %s", helper_path)
-                return False
+                return False, ""
 
             base_dir, hidden_zip = _extract_artifact_for_validation(workdir, row, patch_path)
 
             old_result_dir = base_dir / "result"
             if old_result_dir.exists():
                 _safe_rmtree(old_result_dir)
-                
+
             iterations = test_input.script_validation_iterations
             args = _helper_args_for_row(row, iterations=iterations, code_version="Fixed")
 
@@ -1181,12 +1173,6 @@ def validate_fix(test_input: TestInput, runs: int = 10, patch_path: str | None =
             )
             output = result.stdout + result.stderr
 
-            if "Failed to apply patch" in output:
-                logger.info(
-                    "Candidate patch did not apply cleanly to the validation base - rejecting."
-                )
-                return False
-
             # Print only the CODE_VERSION=Fixed result summary. The helper deletes
             # data/<issue>/Fixed after running, but keeps logs under result/Fixed/.
             _log_fixed_result_summary(base_dir, output, result.returncode)
@@ -1202,22 +1188,27 @@ def validate_fix(test_input: TestInput, runs: int = 10, patch_path: str | None =
             if result.returncode != 0:
                 logger.info("Script validation failed with exit code %d", result.returncode)
                 logger.info("Validation stdout/stderr preview:\n%s", output[:3000])
-                return False
+                # A build failure (e.g. `mvn clean install ... -am` dying under
+                # `set -e` before any test even runs) can leave fixed_output
+                # empty/uninformative, since the helper never gets to produce
+                # its Fixed-only log. Fall back to the raw combined output so
+                # the compiler diagnostics aren't lost.
+                return False, fixed_output or output
 
             if _has_failure_markers(fixed_output):
                 logger.info("Script validation found failure markers in result/Fixed only.")
                 logger.info("Failure marker details for Fixed only:\n%s", _failure_marker_report(fixed_output))
-                return False
+                return False, fixed_output
 
             logger.info(
                 "Fix validated by ReproFlake helper on patched Fixed artifact (%d iterations).",
                 iterations,
             )
-            return True
+            return True, fixed_output
 
         except Exception as exc:
             logger.error("Script-based validation failed: %s", exc)
-            return False
+            return False, str(exc)
         finally:
             _restore_hidden_zip(hidden_zip)
 
@@ -1226,6 +1217,18 @@ def validate_fix(test_input: TestInput, runs: int = 10, patch_path: str | None =
         passed, output = _run_once(cmd, cwd=test_input.repo_root)
         if not passed:
             logger.info("Validation failed on run %d/%d", i + 1, runs)
-            return False
+            return False, output
     logger.info("Fix validated: test passed %d/%d runs.", runs, runs)
-    return True
+    return True, ""
+
+
+def validate_fix(test_input: TestInput, runs: int = 10, patch_path: str | None = None) -> bool:
+    """
+    Validate a generated fix.
+
+    Thin bool-only wrapper around validate_fix_detailed() for existing
+    callers. See validate_fix_detailed() for a version that also returns the
+    raw validation output.
+    """
+    passed, _output = validate_fix_detailed(test_input, runs=runs, patch_path=patch_path)
+    return passed

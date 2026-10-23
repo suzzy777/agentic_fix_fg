@@ -1,0 +1,29 @@
+FROM flaky_base_jdk8_od
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y wget tar make g++ && apt-get clean
+
+RUN apt-get update && \
+    apt-get install -y xmlstarlet && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN sudo wget https://github.com/protocolbuffers/protobuf/releases/download/v2.5.0/protobuf-2.5.0.tar.gz && \
+    tar -xzf protobuf-2.5.0.tar.gz && \
+    cd protobuf-2.5.0 && \
+    ./configure && make && make install && ldconfig && \
+    cd .. && rm -rf protobuf-2.5.0 protobuf-2.5.0.tar.gz
+
+
+RUN git clone https://github.com/TestingResearchIllinois/maven-surefire.git /app/maven-surefire
+
+RUN cd /app/maven-surefire && \
+    mvn install -DskipTests -Drat.skip -Denforcer.skip
+
+RUN mkdir -p /usr/share/maven/lib/ext && \
+    cp /app/maven-surefire/surefire-changing-maven-extension/target/surefire-changing-maven-extension-1.0-SNAPSHOT.jar /usr/share/maven/lib/ext/
+
+RUN rm -rf /app/maven-surefire && apt-get autoremove -y && apt-get clean
+
+CMD ["/bin/bash"]
+

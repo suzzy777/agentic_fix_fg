@@ -1,3 +1,21 @@
+"""
+editing/search_replace.py – parse and apply SEARCH/REPLACE patches.
+
+This version follows the original FlakyGuard/Aider-style parsing approach
+more closely than the earlier simplified regex parser.
+
+Original FlakyGuard used:
+- find_original_update_blocks(...)
+- find_filename(...)
+- Aider-style SEARCH/REPLACE block rules
+
+The simplified API is preserved:
+- parse_fix(...)
+- apply_fix(...)
+- revert_all(...)
+- write_patch_file(...)
+"""
+
 from __future__ import annotations
 
 import datetime
@@ -9,290 +27,317 @@ from pathlib import Path
 
 from models import SearchReplaceEdit, Fix
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-_CODE_FENCE = ("```", "```")
+# ── Aider / original-FlakyGuard style parser constants ───────────────────────
 
-_OPEN_RE = re.compile(r"^[<]{5,9} SEARCH\s*$")
-_MID_RE = re.compile(r"^[=]{5,9}\s*$")
-_CLOSE_RE = re.compile(r"^[>]{5,9} REPLACE\s*$")
+fence = ("```", "```")
+DEFAULT_FENCE = fence
 
-_OPEN_TOKEN = "<<<<<<< SEARCH"
-_MID_TOKEN = "======="
-_CLOSE_TOKEN = ">>>>>>> REPLACE"
+HEAD = r"^<{5,9} SEARCH\s*$"
+DIVIDER = r"^={5,9}\s*$"
+UPDATED = r"^>{5,9} REPLACE\s*$"
 
-_NO_PATH_MSG = (
-    "Could not determine the target file. Put the path on its own line "
-    "directly above the opening {fence} fence."
+HEAD_ERR = "<<<<<<< SEARCH"
+DIVIDER_ERR = "======="
+UPDATED_ERR = ">>>>>>> REPLACE"
+
+missing_filename_err = (
+    "Bad/missing filename. The filename must be alone on the line before "
+    "the opening fence {fence[0]}"
 )
 
-_SOURCE_SUFFIXES = (".java", ".py", ".go")
 
-
-# ── Filename recovery ────────────────────────────────────────────────────────
-
-def _clean_path_line(raw: str, fence: tuple[str, str]) -> str | None:
-    """Turn a candidate path line into a bare path, or None if it isn't one."""
-    candidate = raw.strip()
-
-    if candidate == "...":
-        return None
-    if candidate.startswith(fence[0]):
-        return None
-
-    for stripper in (
-        lambda s: s.rstrip(":"),
-        lambda s: s.lstrip("#"),
-        lambda s: s.strip(),
-        lambda s: s.strip("`"),
-        lambda s: s.strip("*"),
-    ):
-        candidate = stripper(candidate)
-
-    return candidate or None
-
-
-def _canonical_path(path: str, known_paths: list[str]) -> str:
-    """Map a possibly-shortened path onto a known path when we can."""
-    path = path.strip().replace("\\", "/").lstrip("/")
-
-    if path in known_paths:
-        return path
-
-    tail_hits = [
-        known for known in known_paths
-        if known.replace("\\", "/").endswith(path)
-    ]
-    if len(tail_hits) == 1:
-        return tail_hits[0]
-
-    return path
-
-
-def _is_probably_sentence(value: str) -> bool:
+def strip_filename(filename: str, fence: tuple[str, str]):
     """
-    Heuristic guard so explanatory prose ("Looking at this test...") is never
-    mistaken for a file path. The upstream parser is looser, but here we always
-    have a known default test file to fall back on, so being strict is safer.
+    Original FlakyGuard/Aider helper.
+
+    Cleans a candidate filename line found near a SEARCH/REPLACE block.
+    """
+    filename = filename.strip()
+
+    if filename == "...":
+        return None
+
+    start_fence = fence[0]
+    if filename.startswith(start_fence):
+        return None
+
+    filename = filename.rstrip(":")
+    filename = filename.lstrip("#")
+    filename = filename.strip()
+    filename = filename.strip("`")
+    filename = filename.strip("*")
+
+    return filename or None
+
+def _resolve_fname(fname: str, valid_fnames: list[str]) -> str:
+    fname = fname.strip().replace("\\", "/").lstrip("/")
+
+    if fname in valid_fnames:
+        return fname
+
+    matches = [
+        valid for valid in valid_fnames
+        if valid.replace("\\", "/").endswith(fname)
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return fname
+
+def _looks_like_prose(value: str) -> bool:
+    """
+    Reject obvious explanation text.
+
+    This is the only small safety guard added around the original methodology.
+    It prevents sentences like "Looking at this test..." from being treated as
+    filenames. The original parser is more flexible than the simplified regex,
+    but the simplified setup has a known default file, so falling back is safer.
     """
     text = value.strip()
     if not text:
         return True
+
     if len(text) > 260:
         return True
 
-    opener = (
-        "looking ", "given ", "based ", "the ", "this ",
-        "i ", "i'll ", "let me ", "to fix ", "we need ", "here ",
+    lowered = text.lower()
+    prose_starts = (
+        "looking ",
+        "given ",
+        "based ",
+        "the ",
+        "this ",
+        "i ",
+        "i'll ",
+        "let me ",
+        "to fix ",
+        "we need ",
+        "here ",
     )
-    if text.lower().startswith(opener):
+    if lowered.startswith(prose_starts):
         return True
 
-    if text.count(" ") >= 4 and not text.endswith(_SOURCE_SUFFIXES):
+    # A natural-language sentence with many spaces is not a path.
+    if text.count(" ") >= 4 and not text.endswith((".java", ".py", ".go")):
         return True
 
     return False
 
 
-def _dedupe(known_paths: list[str] | None) -> list[str]:
-    if not known_paths:
+def _normalize_valid_fnames(valid_fnames: list[str] | None) -> list[str]:
+    if not valid_fnames:
         return []
-    seen: list[str] = []
-    for path in known_paths:
-        if path and path not in seen:
-            seen.append(path)
-    return seen
+    result = []
+    for fname in valid_fnames:
+        if fname and fname not in result:
+            result.append(fname)
+    return result
 
 
-def _recover_target_path(
-    preceding: list[str],
+def find_filename(
+    lines: list[str],
     fence: tuple[str, str],
-    known_paths: list[str] | None,
+    valid_fnames: list[str] | None,
 ):
     """
-    Look at the handful of lines just above a SEARCH marker and decide which
-    file the block refers to. Tries exact, then basename, then fuzzy matching
-    against the known paths before giving up.
+    Original FlakyGuard/Aider-style filename lookup.
+
+    It searches backward through the few lines before a SEARCH block, rather
+    than blindly assuming the immediately previous line is a filename.
     """
-    known_paths = _dedupe(known_paths)
+    valid_fnames = _normalize_valid_fnames(valid_fnames)
 
-    # Walk upward, newest line first, only as long as we keep hitting fences /
-    # a path-looking line.
-    window = list(reversed(preceding))[:3]
+    # Go back through the 3 preceding lines.
+    lines = list(lines)
+    lines.reverse()
+    lines = lines[:3]
 
-    candidates: list[str] = []
-    for entry in window:
-        parsed = _clean_path_line(entry, fence)
-        if parsed:
-            candidates.append(parsed)
-        if not entry.startswith(fence[0]):
+    filenames: list[str] = []
+    for line in lines:
+        filename = strip_filename(line, fence)
+        if filename:
+            filenames.append(filename)
+
+        # Only continue as long as we keep seeing fences.
+        if not line.startswith(fence[0]):
             break
 
-    if not candidates:
+    if not filenames:
         return None
 
-    # 1) exact
-    for name in candidates:
-        if name in known_paths:
-            return name
+    # Exact match first.
+    for fname in filenames:
+        if fname in valid_fnames:
+            return fname
 
-    # 2) basename
-    for name in candidates:
-        for known in known_paths:
-            if name == Path(known).name:
-                return known
+    # Basename match.
+    for fname in filenames:
+        for valid_fname in valid_fnames:
+            if fname == Path(valid_fname).name:
+                return valid_fname
 
-    # 3) fuzzy
-    for name in candidates:
-        near = difflib.get_close_matches(name, known_paths, n=1, cutoff=0.8)
-        if len(near) == 1:
-            return near[0]
+    # Fuzzy match.
+    for fname in filenames:
+        close_matches = difflib.get_close_matches(
+            fname,
+            valid_fnames,
+            n=1,
+            cutoff=0.8,
+        )
+        if len(close_matches) == 1:
+            return close_matches[0]
 
-    # With a known-path list, refuse to accept random prose as a path.
-    if known_paths:
-        for name in candidates:
-            if _is_probably_sentence(name):
+    # If we know valid filenames, do not fall back to random prose.
+    if valid_fnames:
+        for fname in filenames:
+            if _looks_like_prose(fname):
                 continue
-            if name.endswith(_SOURCE_SUFFIXES) or "/" in name or "\\" in name:
-                return name
+            if fname.endswith((".java", ".py", ".go")) or "/" in fname or "\\" in fname:
+                return fname
         return None
 
-    # No known-path list: looser fallbacks.
-    for name in candidates:
-        if "." in name and not _is_probably_sentence(name):
-            return name
-    for name in candidates:
-        if not _is_probably_sentence(name):
-            return name
+    # Original fallback behavior when no valid filename list is available.
+    for fname in filenames:
+        if "." in fname and not _looks_like_prose(fname):
+            return fname
+
+    for fname in filenames:
+        if not _looks_like_prose(fname):
+            return fname
 
     return None
 
 
-# ── Block extraction ─────────────────────────────────────────────────────────
-
-def _extract_patch_sections(
-    text: str,
-    fence: tuple[str, str] = _CODE_FENCE,
-    known_paths: list[str] | None = None,
+def find_original_update_blocks(
+    content: str,
+    fence: tuple[str, str] = DEFAULT_FENCE,
+    valid_fnames: list[str] | None = None,
 ):
     """
-    Scan an LLM reply and pull out every SEARCH/REPLACE section.
+    Original FlakyGuard/Aider-style SEARCH/REPLACE block parser.
 
-    Returns a list of ``(path, search_body, replace_body)`` tuples. Consecutive
-    blocks may share a path (a REPLACE body may be terminated by the next
-    divider rather than a REPLACE marker).
+    Returns:
+        list of (filename, original_text, updated_text)
     """
-    rows = text.splitlines(keepends=True)
-    total = len(rows)
-    cursor = 0
-    active_path: str | None = None
-    sections: list[tuple[str, str, str]] = []
+    lines = content.splitlines(keepends=True)
+    i = 0
+    current_filename = None
 
-    def _stripped(idx: int) -> str:
-        return rows[idx].strip()
+    head_pattern = re.compile(HEAD)
+    divider_pattern = re.compile(DIVIDER)
+    updated_pattern = re.compile(UPDATED)
 
-    while cursor < total:
-        if not _OPEN_RE.match(rows[cursor].strip()):
-            cursor += 1
-            continue
+    result: list[tuple[str, str, str]] = []
 
-        try:
-            # When a divider follows immediately, the path lives purely in the
-            # preceding lines (no known-path disambiguation).
-            look_back = rows[max(0, cursor - 3):cursor]
-            if cursor + 1 < total and _MID_RE.match(_stripped(cursor + 1)):
-                path = _recover_target_path(look_back, fence, None)
-            else:
-                path = _recover_target_path(look_back, fence, known_paths)
+    while i < len(lines):
+        line = lines[i]
 
-            if not path:
-                if active_path:
-                    path = active_path
+        if head_pattern.match(line.strip()):
+            try:
+                if i + 1 < len(lines) and divider_pattern.match(lines[i + 1].strip()):
+                    filename = find_filename(lines[max(0, i - 3):i], fence, None)
                 else:
-                    raise ValueError(_NO_PATH_MSG.format(fence=fence))
-            active_path = path
+                    filename = find_filename(lines[max(0, i - 3):i], fence, valid_fnames)
 
-            # Gather the SEARCH body up to the divider.
-            cursor += 1
-            search_lines: list[str] = []
-            while cursor < total and not _MID_RE.match(_stripped(cursor)):
-                search_lines.append(rows[cursor])
-                cursor += 1
+                if not filename:
+                    if current_filename:
+                        filename = current_filename
+                    else:
+                        raise ValueError(missing_filename_err.format(fence=fence))
 
-            if cursor >= total or not _MID_RE.match(_stripped(cursor)):
-                raise ValueError(f"missing `{_MID_TOKEN}` divider")
+                current_filename = filename
 
-            # Gather the REPLACE body up to the closing marker or the next
-            # divider (chained block).
-            cursor += 1
-            replace_lines: list[str] = []
-            while cursor < total and not (
-                _CLOSE_RE.match(_stripped(cursor))
-                or _MID_RE.match(_stripped(cursor))
-            ):
-                replace_lines.append(rows[cursor])
-                cursor += 1
+                original_text: list[str] = []
+                i += 1
+                while i < len(lines) and not divider_pattern.match(lines[i].strip()):
+                    original_text.append(lines[i])
+                    i += 1
 
-            if cursor >= total or not (
-                _CLOSE_RE.match(_stripped(cursor))
-                or _MID_RE.match(_stripped(cursor))
-            ):
-                raise ValueError(
-                    f"block never closed with `{_CLOSE_TOKEN}` or `{_MID_TOKEN}`"
-                )
+                if i >= len(lines) or not divider_pattern.match(lines[i].strip()):
+                    raise ValueError(f"Expected `{DIVIDER_ERR}`")
 
-            sections.append(
-                (path, "".join(search_lines), "".join(replace_lines))
-            )
+                updated_text: list[str] = []
+                i += 1
+                while (
+                    i < len(lines)
+                    and not updated_pattern.match(lines[i].strip())
+                    and not divider_pattern.match(lines[i].strip())
+                ):
+                    updated_text.append(lines[i])
+                    i += 1
 
-        except ValueError as err:
-            consumed = "".join(rows[: cursor + 1])
-            raise ValueError(f"{consumed}\n^^^ {err.args[0]}") from err
+                if i >= len(lines) or not (
+                    updated_pattern.match(lines[i].strip())
+                    or divider_pattern.match(lines[i].strip())
+                ):
+                    raise ValueError(f"Expected `{UPDATED_ERR}` or `{DIVIDER_ERR}`")
 
-        cursor += 1
+                result.append((filename, "".join(original_text), "".join(updated_text)))
 
-    return sections
+            except ValueError as exc:
+                processed = "".join(lines[: i + 1])
+                err = exc.args[0]
+                raise ValueError(f"{processed}\n^^^ {err}") from exc
+
+        i += 1
+
+    return result
 
 
-# ── High-level parsing API ───────────────────────────────────────────────────
+# ── Public parsing API used by the simplified pipeline ───────────────────────
 
 def parse_edits(
     llm_response: str,
     default_filepath: str = "",
     valid_fnames: list[str] | None = None,
 ) -> list[SearchReplaceEdit]:
-    """Pull SearchReplaceEdit objects out of an LLM reply."""
-    known = _dedupe(valid_fnames)
-    if default_filepath and default_filepath not in known:
-        known.append(default_filepath)
+    """
+    Extract search/replace edits from the LLM response.
+
+    This uses the original FlakyGuard/Aider-style parser, with the simplified
+    test file as a valid/default filename when available.
+    """
+    valid = _normalize_valid_fnames(valid_fnames)
+    if default_filepath and default_filepath not in valid:
+        valid.append(default_filepath)
 
     edits: list[SearchReplaceEdit] = []
+
     try:
-        sections = _extract_patch_sections(
+        blocks = find_original_update_blocks(
             llm_response,
-            fence=_CODE_FENCE,
-            known_paths=known or None,
+            fence=DEFAULT_FENCE,
+            valid_fnames=valid or None,
         )
-        for path, search_body, replace_body in sections:
-            target = path or default_filepath
-            target = _canonical_path(target or default_filepath, valid_fnames)
-            edits.append(
-                SearchReplaceEdit(
-                    filepath=target,
-                    search_text=search_body.rstrip("\n"),
-                    replace_text=replace_body.rstrip("\n"),
-                )
-            )
-    except Exception as err:  # noqa: BLE001 - best-effort parse
-        log.warning("Could not parse SEARCH/REPLACE blocks: %s", err)
+
+        
+
+        for filename, search_text, replace_text in blocks:
+            #filepath = _resolve_fname(filepath or default_filepath, valid_fnames)
+
+            filepath = filename or default_filepath
+
+            filepath = _resolve_fname(filepath or default_filepath, valid_fnames)
+            
+            edits.append(SearchReplaceEdit(
+                filepath=filepath,
+                search_text=search_text.rstrip("\n"),
+                replace_text=replace_text.rstrip("\n"),
+            ))
+
+    except Exception as exc:
+        logger.warning("Failed to parse SEARCH/REPLACE blocks: %s", exc)
 
     return edits
 
 
 def parse_explanation(llm_response: str) -> str:
-    """Return the text inside <EXPLANATION>...</EXPLANATION>, if present."""
-    hit = re.search(r"<EXPLANATION>(.*?)</EXPLANATION>", llm_response, re.DOTALL)
-    return hit.group(1).strip() if hit else ""
+    """Extract text between <EXPLANATION> tags."""
+    match = re.search(r"<EXPLANATION>(.*?)</EXPLANATION>", llm_response, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
 
 def parse_fix(
@@ -300,7 +345,7 @@ def parse_fix(
     default_filepath: str = "",
     valid_fnames: list[str] | None = None,
 ) -> Fix:
-    """Build a Fix (edits + explanation) from an LLM reply."""
+    """Parse a complete Fix from an LLM response."""
     return Fix(
         edits=parse_edits(
             llm_response,
@@ -311,60 +356,52 @@ def parse_fix(
     )
 
 
-# ── File snapshots for atomic application ────────────────────────────────────
+# ── Application API used by the simplified pipeline ──────────────────────────
 
 class FileBackup:
-    """Holds one file's contents so it can be restored on failure."""
+    """Saves and restores a single file."""
 
     def __init__(self, filepath: str):
         self.filepath = filepath
-        self._original: str | None = None
-
-    # Kept for callers/tests that read the saved text directly.
-    @property
-    def _backup(self) -> str | None:  # noqa: D401 - compat shim
-        return self._original
+        self._backup: str | None = None
 
     def save(self) -> bool:
         try:
-            with open(self.filepath, "r", encoding="utf-8", errors="replace") as fh:
-                self._original = fh.read()
+            with open(self.filepath, "r", encoding="utf-8", errors="replace") as file:
+                self._backup = file.read()
             return True
-        except OSError as err:
-            log.error("Could not snapshot %s: %s", self.filepath, err)
+        except OSError as exc:
+            logger.error("Backup failed for %s: %s", self.filepath, exc)
             return False
 
     def revert(self) -> bool:
-        if self._original is None:
+        if self._backup is None:
             return False
+
         try:
-            with open(self.filepath, "w", encoding="utf-8") as fh:
-                fh.write(self._original)
+            with open(self.filepath, "w", encoding="utf-8") as file:
+                file.write(self._backup)
             return True
-        except OSError as err:
-            log.error("Could not restore %s: %s", self.filepath, err)
+        except OSError as exc:
+            logger.error("Revert failed for %s: %s", self.filepath, exc)
             return False
 
 
-def _substitute(content: str, edit: SearchReplaceEdit) -> tuple[bool, str]:
-    """Replace the first occurrence of edit.search_text, if it exists."""
+def _apply_one_edit(content: str, edit: SearchReplaceEdit) -> tuple[bool, str]:
+    """Apply a single search/replace edit to content."""
     if edit.search_text in content:
         return True, content.replace(edit.search_text, edit.replace_text, 1)
+
     return False, content
-
-
-def _locate_on_disk(edit_path: str, repo_root: str) -> str:
-    """Absolute path for an edit, resolving shortened paths under repo_root."""
-    filepath = edit_path
-    if not os.path.isabs(filepath):
-        filepath = os.path.join(repo_root, filepath)
-    return filepath
 
 
 def apply_fix(fix: Fix, repo_root: str) -> tuple[bool, dict[str, FileBackup] | str]:
     """
-    Apply every edit atomically: resolve paths, pre-validate all search texts,
-    snapshot the files, write, and roll everything back if any step fails.
+    Apply all edits atomically.
+
+    This matches the original behavior conceptually:
+    pre-check all edits, back up all files, apply edits, and revert everything
+    on failure.
     """
     if not fix.edits:
         return False, "No search-replace edits to apply"
@@ -372,37 +409,53 @@ def apply_fix(fix: Fix, repo_root: str) -> tuple[bool, dict[str, FileBackup] | s
     resolved: list[tuple[str, SearchReplaceEdit]] = []
 
     for edit in fix.edits:
-        filepath = _locate_on_disk(edit.filepath, repo_root)
+        filepath = edit.filepath
+        if not os.path.isabs(filepath):
+            filepath = os.path.join(repo_root, filepath)
 
+        # if not os.path.isfile(filepath):
+        #     return False, f"File does not exist: {filepath}"
         if not os.path.isfile(filepath):
-            # Try to resolve a shortened path by unique suffix match.
-            wanted = edit.filepath.replace("\\", "/").lstrip("/")
-            hits = []
-            for root, _dirs, names in os.walk(repo_root):
-                for name in names:
-                    full = os.path.join(root, name)
-                    rel = os.path.relpath(full, repo_root).replace("\\", "/")
-                    if rel.endswith(wanted):
-                        hits.append(full)
+            original = edit.filepath.replace("\\", "/").lstrip("/")
 
-            if len(hits) == 1:
-                filepath = hits[0]
+            matches = []
+            for root, _, files in os.walk(repo_root):
+                for name in files:
+                    candidate = os.path.join(root, name)
+                    rel = os.path.relpath(candidate, repo_root).replace("\\", "/")
+
+                    if rel.endswith(original):
+                        matches.append(candidate)
+
+            if len(matches) == 1:
+                filepath = matches[0]
                 edit.filepath = os.path.relpath(filepath, repo_root)
-                log.info("Resolved short path %r -> %s", wanted, edit.filepath)
+                logger.info(
+                    "Resolved shortened patch path %r to %s",
+                    original,
+                    edit.filepath,
+                )
             else:
                 return False, (
                     f"File does not exist: {filepath}\n"
-                    f"Could not uniquely resolve short path {wanted!r}; "
-                    f"matches={len(hits)}"
+                    f"Could not uniquely resolve short path {original!r}; "
+                    f"matches={len(matches)}"
                 )
-
+    
         resolved.append((filepath, edit))
 
-    # Pre-flight: every search text must be present before we touch anything.
+    # Pre-check all edits before writing anything.
     for filepath, edit in resolved:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-            disk_text = fh.read()
-        if disk_text.find(edit.search_text) == -1:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as file:
+            content = file.read()
+
+        # if edit.search_text not in content:
+        #     return False, (
+        #         f"Pre-validation failed in {filepath}: "
+        #         f"Search text not found:\n{edit.search_text[:200]}..."
+        #     )
+
+        if edit.search_text not in content:
             return False, (
                 f"Pre-validation failed in {filepath}: "
                 f"Search text not found:\n"
@@ -413,45 +466,45 @@ def apply_fix(fix: Fix, repo_root: str) -> tuple[bool, dict[str, FileBackup] | s
 
     backups: dict[str, FileBackup] = {}
     try:
-        for filepath, _edit in resolved:
+        for filepath, _ in resolved:
             if filepath not in backups:
-                snapshot = FileBackup(filepath)
-                if not snapshot.save():
+                backup = FileBackup(filepath)
+                if not backup.save():
                     return False, f"Could not back up {filepath}"
-                backups[filepath] = snapshot
+                backups[filepath] = backup
 
-        working = {
-            filepath: (backups[filepath]._original or "")
+        file_contents = {
+            filepath: backups[filepath]._backup or ""
             for filepath in backups
         }
 
         for filepath, edit in resolved:
-            ok, updated = _substitute(working[filepath], edit)
+            ok, new_content = _apply_one_edit(file_contents[filepath], edit)
             if not ok:
                 raise ValueError(
                     f"Search text not found during application in {filepath}:\n"
                     f"{edit.search_text[:200]}..."
                 )
-            working[filepath] = updated
+            file_contents[filepath] = new_content
 
-        for filepath, content in working.items():
-            with open(filepath, "w", encoding="utf-8") as fh:
-                fh.write(content)
-                fh.flush()
-                os.fsync(fh.fileno())
+        for filepath, content in file_contents.items():
+            with open(filepath, "w", encoding="utf-8") as file:
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
 
         return True, backups
 
-    except Exception as err:  # noqa: BLE001 - roll back on any failure
-        for snapshot in backups.values():
-            snapshot.revert()
-        return False, f"Atomic operation failed, all changes reverted: {err}"
+    except Exception as exc:
+        for backup in backups.values():
+            backup.revert()
+        return False, f"Atomic operation failed, all changes reverted: {exc}"
 
 
 def revert_all(backups: dict[str, FileBackup]) -> None:
-    """Restore every snapshotted file."""
-    for snapshot in backups.values():
-        snapshot.revert()
+    """Revert all backed-up files."""
+    for backup in backups.values():
+        backup.revert()
 
 
 def write_patch_file(
@@ -460,39 +513,40 @@ def write_patch_file(
     prefix: str = "fix",
     repo_root: str | None = None,
 ) -> str:
-    """
-    Emit a unified diff for the applied edits.
+    """Write a unified diff patch file to output_dir.
 
-    With repo_root set, headers use repo-relative paths so the diff applies to
-    the artifact copy with ``patch -p1``.
+    If repo_root is provided, patch headers use repo-relative paths so the
+    patch can be applied to the ReproFlake artifact copy with patch -p1.
     """
     os.makedirs(output_dir, exist_ok=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    patch_path = os.path.join(output_dir, f"{prefix}_{stamp}.patch")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    patch_path = os.path.join(output_dir, f"{prefix}_{timestamp}.patch")
 
-    with open(patch_path, "w", encoding="utf-8") as out:
-        for filepath, snapshot in backups.items():
-            before = (snapshot._original or "").splitlines(keepends=True)
+    with open(patch_path, "w", encoding="utf-8") as patch_file:
+        for filepath, backup in backups.items():
+            original = (backup._backup or "").splitlines(keepends=True)
 
             try:
-                with open(filepath, "r", encoding="utf-8") as fh:
-                    after = fh.readlines()
+                with open(filepath, "r", encoding="utf-8") as file:
+                    modified = file.readlines()
             except OSError:
                 continue
 
             if repo_root:
                 try:
-                    rel = os.path.relpath(filepath, repo_root)
+                    relpath = os.path.relpath(filepath, repo_root)
                 except ValueError:
-                    rel = os.path.basename(filepath)
+                    relpath = os.path.basename(filepath)
             else:
-                rel = os.path.basename(filepath)
-            rel = rel.replace(os.sep, "/")
+                relpath = os.path.basename(filepath)
+            relpath = relpath.replace(os.sep, "/")
 
-            out.writelines(
-                difflib.unified_diff(
-                    before, after, fromfile=f"a/{rel}", tofile=f"b/{rel}"
-                )
+            diff = difflib.unified_diff(
+                original,
+                modified,
+                fromfile=f"a/{relpath}",
+                tofile=f"b/{relpath}",
             )
+            patch_file.writelines(diff)
 
     return patch_path

@@ -19,20 +19,16 @@ MVNOPTIONS="-Ddependency-check.skip=true -Dgpg.skip=true -DfailIfNoTests=false \
 
 mvn clean install -DskipTests -pl "$MODULE" -am $MVNOPTIONS 
 
+NONDEXSEED="${NONDEXSEED%%.*}"   # test_config.csv may carry it as 933178.0; nondex wants a long
 if [ -n "$NONDEXSEED" ]; then
    SEED_PARAM="-DnondexSeed=$NONDEXSEED"
 else
    SEED_PARAM=""
 fi
 
-if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
-    echo "SKIP_COVERAGE=1 -> skipping coverage generation"
-else
-    bash ./coverage_generator.sh "$MODULE" . "$TEST" 1 id "$NONDEXSEED" 2.1.7 || echo "Coverage failed; continuing"
-fi
 
 OUTPUT=$(mvn -pl "$MODULE" edu.illinois:nondex-maven-plugin:2.1.7:nondex \
- $SEED_PARAM -DnondexRuns=$rounds -Dtest="$TEST" $MVNOPTIONS 2>&1)
+ $SEED_PARAM -DnondexRuns=$rounds -Dtest="$TEST" $MVNOPTIONS 2>&1) || true  # nondex exits non-zero when the test fails; do not let set -e abort
 EXEC_IDS=$(echo "$OUTPUT" | grep "nondexExecid=" | sed -E 's/.*nondexExecid=([^\ ]+).*/\1/')
 SEEDS=$(echo "$OUTPUT" | grep "nondexSeed=" | sed -E 's/.*nondexSeed=([^\ ]+).*/\1/')
 
@@ -86,6 +82,15 @@ while IFS=',' read -r line seed; do
         ((iteration++))
     fi
 done < filtered_output.txt
+
+# Coverage: re-run each failing seed once with jacoco attached.
+rm -f coverage_results.csv
+while IFS=',' read -r iter execid seed xml_file result rest; do
+    if [[ "$result" == "failure" || "$result" == "error" ]]; then
+        bash ./coverage_generator.sh "$MODULE" . "$TEST" 1 id "$seed" 2.1.7 "$iter" || echo "Failing-run coverage failed for seed $seed; continuing"
+    fi
+done < <(tail -n +2 "$CSV_FILE")
+[[ -f coverage_results.csv ]] && mv coverage_results.csv flaky-result/coverage_results.csv
 
 ls -a
 

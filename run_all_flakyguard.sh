@@ -6,6 +6,11 @@ REPRO_SCRIPT="single_runner.sh"
 SUMMARY_FILE="flakyguard_batch_summary.csv"
 SUCCESS_PATCH_DIR="successful_patches"
 
+# NonDex rounds used for step [1/3] reproduction. ReproFlake seeds are only
+# reproducible in an identical JVM/NonDex environment, and ID tests often fail
+# for just some of the seeds (e.g. 3/5), so one round is not enough.
+export FLAKYGUARD_REPRO_ITERATIONS="${FLAKYGUARD_REPRO_ITERATIONS:-10}"
+
 mkdir -p "$SUCCESS_PATCH_DIR"
 
 if [[ ! -s "$CSV_FILE" ]]; then
@@ -16,14 +21,15 @@ fi
 printf 'issue_id,status,exit_code,log_file,working_patch,saved_working_patch\n' > "$SUMMARY_FILE"
 
 while IFS=, read -r test_type issue_id; do
-    test_type="${test_type//$'\r'/}"
     issue_id="${issue_id//$'\r'/}"
     [[ -n "$issue_id" ]] || continue
 
-    safe_type=$(printf '%s' "$test_type" | tr -cs '[:alnum:]' '_')
-    [[ -n "$safe_type" ]] || safe_type="run"
+    # Prefix the log with the row's category (id/od/nio/td/...), not a fixed "id_".
+    log_prefix=$(printf '%s' "${test_type//$'\r'/}" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '_')
+    [[ -n "$log_prefix" ]] || log_prefix="run"
+
     safe_issue_id=$(printf '%s' "$issue_id" | tr -cs '[:alnum:]_.-' '_')
-    log_file="${safe_type}_${safe_issue_id}.log"
+    log_file="${log_prefix}_${safe_issue_id}.log"
 
     echo "============================================================"
     echo "Running issue: $issue_id"
@@ -73,4 +79,63 @@ echo
 echo "Finished processing all issues."
 echo "Summary: $SUMMARY_FILE"
 echo "Successful patches: $SUCCESS_PATCH_DIR"
+
+
+
+# #!/usr/bin/env bash
+# set -u
+
+# CSV_FILE="test_config.csv"
+# REPRO_SCRIPT="single_runner.sh"
+# SUMMARY_FILE="flakyguard_batch_summary.csv"
+
+# if [[ ! -s "$CSV_FILE" ]]; then
+#     echo "ERROR: CSV file is missing or empty: $CSV_FILE"
+#     exit 1
+# fi
+
+# printf 'issue_id,status,exit_code,log_file\n' > "$SUMMARY_FILE"
+
+# while IFS= read -r issue_id; do
+#     issue_id="${issue_id//$'\r'/}"
+#     [[ -n "$issue_id" ]] || continue
+
+#     echo "issue_id: $issue_id"
+
+#     safe_issue_id=$(printf '%s' "$issue_id" | tr -cs '[:alnum:]_.-' '_')
+#     log_file="id_${safe_issue_id}.log"
+
+#     echo "============================================================"
+#     echo "Running issue: $issue_id"
+#     echo "Log: $log_file"
+#     echo "============================================================"
+
+#     python3 flakyguard.py \
+#         --language java \
+#         --repro-script "$REPRO_SCRIPT" \
+#         --repro-config-csv "$CSV_FILE" \
+#         --repro-issue-id "$issue_id" \
+#         --use-jacoco-coverage \
+#         --context-attempts 3 \
+#         --thoughts-per-context 2 \
+#         --fixes-per-thought 3 \
+#         < /dev/null > "$log_file" 2>&1
+
+#     exit_code=$?
+
+#     if [[ $exit_code -eq 0 ]]; then
+#         status="completed"
+#     else
+#         status="failed"
+#     fi
+
+#     printf '"%s","%s",%d,"%s"\n' \
+#         "$issue_id" "$status" "$exit_code" "$log_file" \
+#         >> "$SUMMARY_FILE"
+
+# done < <(tail -n +2 "$CSV_FILE" | cut -d, -f2)
+
+# echo
+# echo "Finished processing all issues."
+# echo "Summary: $SUMMARY_FILE"
 

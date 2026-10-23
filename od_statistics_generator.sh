@@ -14,11 +14,7 @@ pass_count=0
 fail_count=0
 error_count=0
 
-if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
-    echo "SKIP_COVERAGE=1 -> skipping coverage generation"
-else
-    bash ./coverage_generator.sh "$module" . "$flakytest" 1 od "$precedingtest" || echo "Coverage failed; continuing"
-fi
+bash ./coverage_generator.sh "$module" . "$flakytest" 1 od "$precedingtest" || echo "Coverage failed; continuing"
 
 for ((i=0; i<iterations; i++)); do
     find . -name "TEST-*.xml" -delete
@@ -69,7 +65,6 @@ fail_count=0
 error_count=0
 
 while IFS=',' read -r col1 col2 col3 col4 col5; do
-    cleaned_result=$(echo "$col2" | xargs)
     if [[ $cleaned_result == "pass" ]]; then
 	((pass_count+=1))
     elif [[ $cleaned_result == "failure" ]]; then

@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+flakyguard.py – CLI entry point for FlakyGuard Simple.
+
+The ReproFlake/script workflow is:
+  1. Reproduce the flaky failure with single_runner.sh + test_config.csv.
+  2. Collect context, optionally narrowed with JaCoCo coverage.
+  3. Run the paper-style M × P × N loop: context, thoughts, then concrete fixes.
+  4. Validate by applying each patch to the artifact's Flaky copy and rerunning
+     the same ReproFlake helper logic on CODE_VERSION=Fixed.
+"""
 
 import argparse
 import logging
@@ -29,8 +39,12 @@ def parse_args():
     )
 
     # Required repair inputs.
-
+    #parser.add_argument("--repo", required=True, help="Absolute path to editable repository root")
     parser.add_argument("--repo", default=".", help="Path to repo; ignored in ReproFlake mode")
+    # parser.add_argument("--test-file", required=True, help="Test file path relative to --repo")
+    # parser.add_argument("--test-func", required=True, help="Test function/method name")
+    # #parser.add_argument("--test-case", help="Test case name; defaults to --test-func")
+    # parser.add_argument("--test-case", default=None)
 
     parser.add_argument(
         "--test-file",
@@ -50,8 +64,24 @@ def parse_args():
     parser.add_argument(
         "--language",
         default="java",
-        choices=["java", "python"],
+        choices=["go", "python", "java"],
         help="Source language (default: java)",
+    )
+    parser.add_argument(
+        "--category",
+        default="",
+        help=(
+            "Optional flaky-test category override (id/od/nio/td/brittle/...). "
+            "Normally inferred from test_config.csv's test_type column."
+        ),
+    )
+    parser.add_argument(
+        "--polluter",
+        default="",
+        help=(
+            "Optional polluter/preceding-test override (OD/britle only). "
+            "Normally inferred from test_config.csv's preceding_test column."
+        ),
     )
 
     # Script-based reproduction/validation.
@@ -118,6 +148,35 @@ def parse_args():
         help="Maximum covered files to use for context (default: 80).",
     )
 
+    # Compilation-retry step (see compile_repair.py). Mirrors original
+    # FlakyGuard's build-error repair: when a candidate fix fails validation
+    # because it broke the build inside the ReproFlake/Docker run (rather
+    # than failing to fix the flakiness), give the LLM a few narrowly-scoped
+    # chances to repair the compiler errors and re-validate before the
+    # candidate is discarded.
+    parser.add_argument(
+        "--no-verify-compile",
+        dest="verify_compile_before_validate",
+        action="store_false",
+        help="Skip the compilation-retry step; discard a build-breaking candidate immediately.",
+    )
+    parser.add_argument(
+        "--max-compile-fix-retries",
+        type=int,
+        default=3,
+        help="Max LLM build-repair-and-re-validate attempts per candidate fix (default: 3).",
+    )
+
+    # Per-call LLM prompt/response logging (see pipeline.py::run_pipeline's
+    # llm_log_dir). On by default; can add up over a large batch, so it's
+    # easy to turn off for bulk/CI runs.
+    parser.add_argument(
+        "--no-log-llm-calls",
+        dest="log_llm_calls",
+        action="store_false",
+        help="Don't persist each LLM call's full prompt+response under patches/llm_calls/.",
+    )
+
     # Paper-style repair-loop parameters: M × P × N.
     parser.add_argument(
         "--attempts",
@@ -152,8 +211,8 @@ def parse_args():
     parser.add_argument(
         "--max-funcs",
         type=int,
-        default=5,
-        help="Global filter F: max functions in context (default: 5)",
+        default=10,
+        help="Global filter F: max functions in context (default: 10)",
     )
     parser.add_argument(
         "--depth",
@@ -165,8 +224,13 @@ def parse_args():
     # Output.
     parser.add_argument(
         "--output-dir",
-        default="patches",
-        help="Directory to save patch files (default: ./patches)",
+        default="runs",
+        help=(
+            "Base directory for each run's patches, run_log.jsonl and llm_calls/ "
+            "(default: runs/ next to this script). Each run gets its own "
+            "<type>_<issue>_<timestamp>/ subfolder, outside the work repo, so it "
+            "survives reruns and data/ cleanup."
+        ),
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
 
@@ -434,6 +498,78 @@ def _infer_java_test_from_config(
         )
 
     return selected.relative_to(repo_path).as_posix(), test_func
+# def _prepare_reproflake_work_repo(args) -> str:
+#     """
+#     Extract ReproFlake artifact to a stable work repo and return Flaky/ path.
+
+#     This avoids generating patches from a separate local checkout that may not
+#     match the ReproFlake artifact.
+#     """
+#     if not getattr(args, "repro_script", None) or not getattr(args, "repro_issue_id", None):
+#         return os.path.abspath(args.repo)
+
+#     workdir = Path(args.repro_workdir).resolve() if getattr(args, "repro_workdir", None) else Path(args.repro_script).resolve().parent
+
+#     csv_path = Path(args.repro_config_csv).resolve() if getattr(args, "repro_config_csv", None) else workdir / "test_config.csv"
+
+
+#     if not zip_path.is_file():
+#         logger.info("Zip missing before work_repo setup; running single_runner once to download it.")
+#         result = subprocess.run(
+#             ["bash", str(Path(args.repro_script).resolve()), args.repro_issue_id],
+#             cwd=str(workdir),
+#             capture_output=True,
+#             text=True,
+#             timeout=300,
+#         )
+
+#     if not zip_path.is_file():
+#         raise FileNotFoundError(
+#             f"ReproFlake zip not found even after running single_runner: {zip_path}\n"
+#             f"stdout:\n{result.stdout[-2000:]}\n"
+#             f"stderr:\n{result.stderr[-2000:]}"
+#         )
+
+#     if not csv_path.is_file():
+#         raise FileNotFoundError(f"test_config.csv not found: {csv_path}")
+
+#     row = _read_reproflake_row(csv_path, args.repro_issue_id)
+#     zip_name = row.get("zip", "").strip()
+#     if not zip_name:
+#         raise RuntimeError(f"No zip column found for issue_id={args.repro_issue_id}")
+
+#     data_dir = workdir / "data"
+#     zip_path = data_dir / f"{zip_name}.zip"
+
+#     if not zip_path.is_file() and getattr(args, "repro_zip", None):
+#         repro_zip = Path(args.repro_zip).resolve()
+#         if repro_zip.is_file():
+#             data_dir.mkdir(parents=True, exist_ok=True)
+#             shutil.copy2(repro_zip, zip_path)
+
+#     if not zip_path.is_file():
+#         raise FileNotFoundError(f"ReproFlake zip not found: {zip_path}")
+
+#     work_repo = data_dir / f"{args.repro_issue_id}_work_repo"
+#     _safe_remove_dir(work_repo)
+#     work_repo.mkdir(parents=True, exist_ok=True)
+
+#     with zipfile.ZipFile(zip_path) as zf:
+#         zf.extractall(work_repo)
+
+#     nested = work_repo / zip_name
+#     if nested.is_dir():
+#         for child in list(nested.iterdir()):
+#             shutil.move(str(child), str(work_repo / child.name))
+#         nested.rmdir()
+
+#     flaky_repo = work_repo / "Flaky"
+#     if not flaky_repo.is_dir():
+#         raise FileNotFoundError(f"Flaky source not found after extraction: {flaky_repo}")
+
+#     logger.info("Using ReproFlake artifact source as repo_root: %s", flaky_repo)
+#     return str(flaky_repo.resolve())
+
 
 def main():
     args = parse_args()
@@ -515,96 +651,189 @@ def main():
         repro_config_csv=args.repro_config_csv,
         repro_zip=args.repro_zip or "",
         repro_timeout=args.repro_timeout,
-        script_validation_iterations=5,
+        script_validation_iterations=10,
         use_jacoco_coverage=args.use_jacoco_coverage,
         coverage_cmd=args.coverage_runner or "",
         coverage_report=args.coverage_report,
         coverage_timeout=args.coverage_timeout,
         coverage_max_files=args.coverage_max_files,
+        verify_compile_before_validate=args.verify_compile_before_validate,
+        max_compile_fix_retries=args.max_compile_fix_retries,
+        log_llm_calls=args.log_llm_calls,
+        category=args.category or (repro_row.get("test_type", "") if repro_row else ""),
+        polluter=args.polluter or (repro_row.get("preceding_test", "") if repro_row else ""),
     )
-    print(f"\n[1/3] Reproducing flaky failure (script issue_id={test_input.repro_issue_id})…")
-    flaky_info = reproduce_failure(test_input)
+    # test_input = TestInput(
+    #     #repo_root=os.path.abspath(args.repo),
+    #     repo_root=repo_root,
+    #     test_file=test_file,
+    #     test_func=args.test_func,
+    #     test_case=args.test_case or args.test_func,
+    #     language=args.language,
+    #     repro_script=args.repro_script,
+    #     repro_issue_id=args.repro_issue_id,
+    #     repro_workdir=args.repro_workdir or "",
+    #     repro_config_csv=args.repro_config_csv,
+    #     repro_zip=args.repro_zip or "",
+    #     repro_timeout=args.repro_timeout,
+    #     script_validation_iterations=10,
+    #     context_attempts=context_attempts,
+    #     thoughts_per_context=args.thoughts_per_context,
+    #     fixes_per_thought=args.fixes_per_thought,
+    #     use_jacoco_coverage=args.use_jacoco_coverage,
+    #     coverage_cmd=args.coverage_runner or "",
+    #     coverage_report=args.coverage_report,
+    #     coverage_timeout=args.coverage_timeout,
+    #     coverage_max_files=args.coverage_max_files,
+    # )
 
-    if flaky_info is None:
-        print("Could not reproduce a failure. Test may not be flaky in this environment.")
-        sys.exit(1)
-
-    print("Failure reproduced.")
-
+    # Not inside test_input.repo_root: the work repo is deleted at the start of
+    # every run of an issue, which used to wipe run_log.jsonl and llm_calls/.
+    runs_base = (
+        args.output_dir if os.path.isabs(args.output_dir)
+        else os.path.join(os.path.dirname(os.path.abspath(__file__)), args.output_dir)
+    )
+    run_name = "_".join(
+        part for part in (
+            (test_input.category or "run").lower(),
+            test_input.repro_issue_id or test_input.test_func,
+            time.strftime("%Y%m%d_%H%M%S"),
+        ) if part
+    )
+    output_dir = os.path.join(runs_base, "".join(c if c.isalnum() or c in "._-" else "_" for c in run_name))
     total_candidates = context_attempts * args.thoughts_per_context * args.fixes_per_thought
-    print(
-        f"\n[2/3] Running fixing pipeline "
-        f"(M={context_attempts}, P={args.thoughts_per_context}, "
-        f"N={args.fixes_per_thought}, candidates={total_candidates})…"
-    )
 
-    output_dir = os.path.join(test_input.repo_root, args.output_dir)
-
+    # Wrapping everything from here through the CSV write in try/finally
+    # guarantees one row per invocation in llm_token_usage.csv, even when
+    # reproduction never succeeds or run_pipeline raises -- previously
+    # either of those exited the process before any row was written, so a
+    # batch run (e.g. via run_all_flakyguard.sh) silently lost failed runs
+    # from the CSV instead of recording them as failures.
     run_start_time = time.time()
+    stage_reached = "reproduce"
+    success = False
+    message = ""
+    run_info: dict = {}
+    exit_code = 0
 
-    success, message = run_pipeline(
-        test_input=test_input,
-        flaky_info=flaky_info,
-        context_attempts=context_attempts,
-        thoughts_per_context=args.thoughts_per_context,
-        fixes_per_thought=args.fixes_per_thought,
-        k=args.children,
-        depth_limit=args.depth,
-        max_funcs=args.max_funcs,
-        output_dir=output_dir,
-    )
+    try:
+        print(f"\n[1/3] Reproducing flaky failure (script issue_id={test_input.repro_issue_id})…")
+        flaky_info = reproduce_failure(test_input)
 
-    run_elapsed_seconds = time.time() - run_start_time
+        if flaky_info is None:
+            print("✗ Could not reproduce a failure. Test may not be flaky in this environment.")
+            message = "Could not reproduce a failure"
+            exit_code = 1
+        else:
+            print("✓ Failure reproduced.")
+            print(f"  Error: {flaky_info.error[:120]}")
 
-    token_rows = consume_token_usage()
+            print(
+                f"\n[2/3] Running fixing pipeline "
+                f"(M={context_attempts}, P={args.thoughts_per_context}, "
+                f"N={args.fixes_per_thought}, candidates={total_candidates})…"
+            )
 
+            stage_reached = "pipeline"
+            success, message, run_info = run_pipeline(
+                test_input=test_input,
+                flaky_info=flaky_info,
+                context_attempts=context_attempts,
+                thoughts_per_context=args.thoughts_per_context,
+                fixes_per_thought=args.fixes_per_thought,
+                k=args.children,
+                depth_limit=args.depth,
+                max_funcs=args.max_funcs,
+                output_dir=output_dir,
+            )
+            stage_reached = "done"
 
-    total_llm_time = sum(r.get("llm_elapsed_seconds", 0.0) for r in token_rows)
+            print("\n[3/3] Result:")
+            if success:
+                print("✓ Fix found and validated.")
+                print(f"  Root cause: {message}")
+                print(f"  Patch saved to: {output_dir}/")
+            else:
+                print(f"✗ No fix found: {message}")
+                exit_code = 2
 
-    total_input = sum(r["llm_input_tokens"] for r in token_rows)
-    total_output = sum(r["llm_output_tokens"] for r in token_rows)
+    except Exception as exc:
+        message = f"Unhandled exception at stage={stage_reached}: {exc}"
+        logger.exception("flakyguard run failed")
+        exit_code = 3
 
-    out_row = dict(repro_row) if repro_row else {}
-    
-    out_row["whole_run_time_seconds"] = round(run_elapsed_seconds, 3)
-    out_row["llm_time_seconds_total"] = round(total_llm_time, 3)
+    finally:
+        run_elapsed_seconds = time.time() - run_start_time
+        token_rows = consume_token_usage()
 
-    out_row["llm_num_calls"] = len(token_rows)
-    out_row["llm_input_tokens_total"] = total_input
-    out_row["llm_output_tokens_total"] = total_output
-    out_row["llm_total_tokens_total"] = total_input + total_output
+        total_llm_time = sum(r.get("llm_elapsed_seconds", 0.0) for r in token_rows)
+        total_input = sum(r["llm_input_tokens"] for r in token_rows)
+        total_output = sum(r["llm_output_tokens"] for r in token_rows)
 
-    out_row["llm_input_tokens_by_call"] = "|".join(
-        str(r["llm_input_tokens"]) for r in token_rows
-    )
-    out_row["llm_output_tokens_by_call"] = "|".join(
-        str(r["llm_output_tokens"]) for r in token_rows
-    )
-    out_row["llm_total_tokens_by_call"] = "|".join(
-        str(r["llm_total_tokens"]) for r in token_rows
-    )
+        out_row = dict(repro_row) if repro_row else {}
 
-    token_csv = Path("llm_token_usage.csv")
-    write_header = not token_csv.exists()
+        out_row["success"] = success
+        out_row["stage_reached"] = stage_reached
+        out_row["whole_run_time_seconds"] = round(run_elapsed_seconds, 3)
+        out_row["total_candidates_tried"] = run_info.get("total_candidates_tried", "")
+        out_row["winning_candidate_index"] = run_info.get("winning_candidate_index", "")
+        out_row["winning_m"] = run_info.get("winning_m", "")
+        out_row["winning_p"] = run_info.get("winning_p", "")
+        out_row["winning_n"] = run_info.get("winning_n", "")
+        out_row["run_log_path"] = run_info.get("step_log_path", "")
+        out_row["covered_files"] = run_info.get("covered_files", "")
+        out_row["covered_lines"] = run_info.get("covered_lines", "")
+        out_row["graph_methods"] = run_info.get("graph_methods", "")
+        out_row["context_methods"] = run_info.get("context_methods", "")
+        out_row["winning_changed_methods"] = (
+            len(run_info["winning_changed_methods"]) if "winning_changed_methods" in run_info else ""
+        )
 
-    fieldnames = list(out_row.keys())
+        out_row["llm_time_seconds_total"] = round(total_llm_time, 3)
+        out_row["llm_num_calls"] = len(token_rows)
+        out_row["llm_input_tokens_total"] = total_input
+        out_row["llm_output_tokens_total"] = total_output
+        out_row["llm_total_tokens_total"] = total_input + total_output
 
-    with token_csv.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(out_row)
+        out_row["llm_input_tokens_by_call"] = "|".join(
+            str(r["llm_input_tokens"]) for r in token_rows
+        )
+        out_row["llm_output_tokens_by_call"] = "|".join(
+            str(r["llm_output_tokens"]) for r in token_rows
+        )
+        out_row["llm_total_tokens_by_call"] = "|".join(
+            str(r["llm_total_tokens"]) for r in token_rows
+        )
 
-    logger.info("Wrote LLM token usage to %s", token_csv)
+        token_csv = Path("llm_token_usage.csv")
+        existing_header: list[str] = []
+        if token_csv.exists():
+            with token_csv.open("r", newline="", encoding="utf-8") as f:
+                existing_header = next(csv.reader(f), [])
 
-    print("\n[3/3] Result:")
-    if success:
-        print("Fix found and validated.")
-        print(f"Root cause: {message}")
-        print(f"Patch saved to: {output_dir}/")
-    else:
-        print(f"No fix found: {message}")
-        sys.exit(2)
+        if existing_header:
+            missing = sorted(set(out_row.keys()) - set(existing_header))
+            if missing:
+                logger.warning(
+                    "llm_token_usage.csv already exists with a different column "
+                    "set; keeping its existing header so old rows stay aligned. "
+                    "These columns from this run will NOT be recorded: %s. "
+                    "Delete or rename the CSV to start fresh with the new schema.",
+                    missing,
+                )
+            fieldnames = existing_header
+        else:
+            fieldnames = list(out_row.keys())
+
+        with token_csv.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore", restval="")
+            if not existing_header:
+                writer.writeheader()
+            writer.writerow(out_row)
+
+        logger.info("Wrote LLM token usage to %s", token_csv)
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

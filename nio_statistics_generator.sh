@@ -28,12 +28,6 @@ build_if_exists() {
 build_if_exists "$TESTRUNNER_DIR" "testrunner"
 build_if_exists "$IDFLAKIES_DIR" "iDFlakies"
 
-if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
-    echo "SKIP_COVERAGE=1 -> skipping coverage generation"
-else
-    bash ./coverage_generator.sh "$module" . "$complete_test_name" 1 nio || echo "Coverage failed; continuing"
-fi
-
 MVNOPTIONS="-Ddependency-check.skip=true -Dgpg.skip=true -DfailIfNoTests=false \
 -Dskip.installnodenpm -Dskip.npm -Dskip.yarn -Dlicense.skip \
 -Dcheckstyle.skip -Drat.skip -Denforcer.skip -Danimal.sniffer.skip -Dmaven.javadoc.skip \
@@ -149,6 +143,32 @@ PY
     printf "%s,%s,%s,%s\n" "$full_test_name" "$status" "$time_value" "${json_quoted:-""}" >> "$CSV_OUT"
   done
 fi
+
+# Coverage of the failing run: NIO has no seed to target (unlike id), so we
+# re-run the same non-idempotent configuration with jacoco attached once per
+# round that actually reproduced the failure above, until NIO_COVERAGE_RUNS
+# coverage runs have confirmed it. This targets an already-confirmed-failing
+# round, the same pattern id_statistics_generator_*.sh uses for its seeds; it
+# does NOT collect coverage blind/upfront the way OD does.
+NIO_COVERAGE_RUNS="${NIO_COVERAGE_RUNS:-1}"
+rm -f coverage_results.csv
+covered=0
+round=0
+while IFS=',' read -r _ status _rest; do
+  round=$((round + 1))
+  status="${status%$'\r'}"
+  status="${status,,}"
+  [[ "$status" == "failure" || "$status" == "error" ]] || continue
+  (( covered < NIO_COVERAGE_RUNS )) || break
+  rc=0
+  bash ./coverage_generator.sh "$module" . "$complete_test_name" 1 nio "" "" "$round" || rc=$?
+  if (( rc == 0 )); then
+    covered=$((covered + 1))
+  else
+    echo "Failing-run coverage for round $round did not yield a failing-run report (exit $rc); continuing"
+  fi
+done < "$CSV_OUT"
+[[ -f coverage_results.csv ]] && mv coverage_results.csv flaky-result/coverage_results.csv
 
 summary_file="flaky-result/summary.txt"
 mkdir -p "$(dirname "$summary_file")"
